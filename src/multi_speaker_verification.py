@@ -20,7 +20,7 @@ torch.serialization.add_safe_globals([
     Resolution
 ])
 
-HF_TOKEN = "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"
+HF_TOKEN = ""
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
