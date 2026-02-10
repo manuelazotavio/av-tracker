@@ -11,3 +11,6 @@ huggingface-hub>=0.17.0
 torch>=2.0.0
 torchaudio>=2.0.0
 speechbrain>=0.5.13
+spacy>=3.7.0
+transformers>=4.35.0
+sentencepiece>=0.1.99
