@@ -1,11 +1,12 @@
 import os
 import time
+import random
 from remotezip import RemoteZip
 import requests
 
 url = "https://huggingface.co/datasets/ProgramComputer/voxceleb/resolve/main/vox1/vox1_dev_wav.zip"
-QTD_ATORES = 1000  # Atenção: Isso é quase o dataset todo (o total é ~1211 atores)
-PASTA_DESTINO = "./vox_100_atores"
+QTD_ATORES = 300  # Atenção: Isso é quase o dataset todo (o total é ~1211 atores)
+PASTA_DESTINO = "./vox_300_atores"
 
 def baixar_com_retry():
     while True:
@@ -14,14 +15,13 @@ def baixar_com_retry():
             # ADIÇÃO 1: Timeout de 60 segundos ou mais para evitar quedas
             with RemoteZip(url, timeout=60) as zip_remoto:
                 lista_arquivos = zip_remoto.namelist()
-                lista_arquivos.sort()
-
-                ids_encontrados = set() # Set é mais rápido para verificar existência
-                arquivos_para_baixar = []
-
-                print("Filtrando lista de atores...")
                 
-                # Identifica os 1000 atores
+                print("Identificando todos os atores disponíveis...")
+                
+                # Primeiro, identifica TODOS os atores disponíveis
+                todos_atores = set()
+                arquivos_por_ator = {}
+                
                 for arquivo in lista_arquivos:
                     if arquivo.endswith('/'): continue
                     
@@ -34,17 +34,31 @@ def baixar_com_retry():
                              break
                     
                     if ator_atual:
-                        # Se ainda não temos 1000 atores, adicionamos novos
-                        if len(ids_encontrados) < QTD_ATORES:
-                            ids_encontrados.add(ator_atual)
-                        
-                        # Se este arquivo é de um ator que está na nossa lista, baixa ele
-                        if ator_atual in ids_encontrados:
-                            arquivos_para_baixar.append(arquivo)
+                        todos_atores.add(ator_atual)
+                        if ator_atual not in arquivos_por_ator:
+                            arquivos_por_ator[ator_atual] = []
+                        arquivos_por_ator[ator_atual].append(arquivo)
+                
+                print(f"✅ Encontrados {len(todos_atores)} atores no dataset")
+                
+                # Seleciona QTD_ATORES aleatoriamente
+                atores_selecionados = random.sample(sorted(todos_atores), min(QTD_ATORES, len(todos_atores)))
+                print(f"✅ Selecionados {len(atores_selecionados)} atores ALEATORIAMENTE")
+                print(f"   Exemplos: {', '.join(sorted(atores_selecionados)[:5])}")
+                
+                # Coleta APENAS 1 arquivo de cada ator selecionado
+                arquivos_para_baixar = []
+                for ator in atores_selecionados:
+                    # Pega apenas o primeiro arquivo .wav deste ator
+                    arquivos_ator = [f for f in arquivos_por_ator[ator] if f.endswith('.wav')]
+                    if arquivos_ator:
+                        arquivos_para_baixar.append(arquivos_ator[0])  # Só o primeiro
+                
+                print(f"✅ Selecionados {len(arquivos_para_baixar)} arquivos (1 por ator)")
 
                 total = len(arquivos_para_baixar)
                 print(f"--- Resumo ---")
-                print(f"Atores selecionados: {len(ids_encontrados)}")
+                print(f"Atores selecionados: {len(atores_selecionados)}")
                 print(f"Total de arquivos de áudio: {total}")
                 print(f"Destino: {PASTA_DESTINO}")
                 print(f"--------------")

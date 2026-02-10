@@ -1,0 +1,8 @@
+ARQUIVO: ../data/mixed_audio/mix_2_speakers/mix_2_speakers_001.wav
+--------------------------------------------------
+
+[0.0s] id10903 (Voz 1): Well, I mean Calais is compiled at 6,000 people, which is an amount that is pretty insignificant in the greater scheme of things.  I mean, 6,000 people would not make that much of a difference to the population.
+[0.0s] id10937 (Voz 2): in a fictional small town called Rome in West Virginia.
+[0.9s] id10903 (Voz 1): LA is composed of 6,000 people, which is a lot.
+[4.6s] id10903 (Voz 1): that is pretty insignificant in the greater scheme of things.  I mean, so.
+[4.6s] id10937 (Voz 2): and it's really about a town's...

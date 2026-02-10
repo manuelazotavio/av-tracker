@@ -29,17 +29,27 @@ class MultiSpeakerVerifier:
 
         count = 0
         for filename in os.listdir(directory):
-            if filename.endswith(".npy"):
-                path = os.path.join(directory, filename)
-                name = os.path.splitext(filename)[0]
-                try:
-                    # Carrega e garante formato Tensor PyTorch
+            path = os.path.join(directory, filename)
+            try:
+                if filename.endswith(".npy"):
+                    name = os.path.splitext(filename)[0]
                     emb_numpy = np.load(path)
                     emb_tensor = torch.from_numpy(emb_numpy).to(self.device)
                     self.embeddings[name] = emb_tensor
                     count += 1
-                except Exception as e:
-                    print(f"❌ Erro ao carregar {filename}: {e}")
+                elif filename.endswith(".pkl"):
+                    import pickle
+                    with open(path, "rb") as f:
+                        profile = pickle.load(f)
+                    name = profile.get("speaker_name") or os.path.splitext(filename)[0]
+                    emb_numpy = profile.get("embedding")
+                    if emb_numpy is None:
+                        raise ValueError("Embedding ausente no perfil")
+                    emb_tensor = torch.from_numpy(emb_numpy).to(self.device)
+                    self.embeddings[name] = emb_tensor
+                    count += 1
+            except Exception as e:
+                print(f"❌ Erro ao carregar {filename}: {e}")
         
         print(f"   ✅ {count} atores carregados na memória.")
 

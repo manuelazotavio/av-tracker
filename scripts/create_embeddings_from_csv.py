@@ -75,7 +75,8 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f'Loading embedding model on {device}...')
-    model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-xvect-voxceleb", run_opts={"device":device})
+    # IMPORTANTE: Usar o mesmo modelo que o verifier usa (ECAPA-TDNN)
+    model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", run_opts={"device":device})
 
     all_embeddings = []
     all_labels = []

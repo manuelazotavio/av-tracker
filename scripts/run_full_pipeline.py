@@ -38,6 +38,36 @@ except ImportError as e:
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
+def load_actors_with_gender(meta_path, wav_root):
+    """Load available actors from CSV with gender info and check if they exist in wav_root."""
+    actors = {}
+    genders = {}
+    
+    # Read metadata
+    with open(meta_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            id_ = row['VoxCeleb1 ID']
+            name = row['VGGFace1 ID']
+            gender = row['Gender']
+            actors[id_] = name
+            genders[id_] = gender
+
+    # Check existence and group by gender
+    available_male = []
+    available_female = []
+    wav_path = Path(wav_root)
+    for id_ in actors:
+        actor_dir = wav_path / id_
+        if actor_dir.exists() and any(actor_dir.iterdir()):
+            if genders[id_] == 'm':
+                available_male.append(id_)
+            elif genders[id_] == 'f':
+                available_female.append(id_)
+    
+    logging.info(f"Found {len(available_male)} male and {len(available_female)} female actors in {wav_root}")
+    return available_male, available_female, actors
+
 def create_profiles_for_actors(actor_ids, actor_names, wav_root, creator):
     """
     Creates .pkl profiles for the selected actors.
@@ -104,16 +134,40 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
 
-    # 1. Load Actors
-    available_ids, actor_names = load_actors(META_PATH, WAV_ROOT)
-    if len(available_ids) < 5:
+    # 1. Load Actors with gender info
+    available_male, available_female, actor_names = load_actors_with_gender(META_PATH, WAV_ROOT)
+    total_available = len(available_male) + len(available_female)
+    if total_available < 5:
         logging.error("Not enough actors found (need at least 5).")
         return
 
-    # Select 5 random actors
-    selected_ids = random.sample(available_ids, 5)
+    # Select balanced actors: 3 male, 2 female (or adjust as needed)
+    selected_ids = []
+    
+    # Try to select 3 male actors
+    if len(available_male) >= 3:
+        selected_male = random.sample(available_male, 3)
+        selected_ids.extend(selected_male)
+    else:
+        selected_ids.extend(available_male)
+    
+    # Try to select 2 female actors
+    if len(available_female) >= 2:
+        selected_female = random.sample(available_female, 2)
+        selected_ids.extend(selected_female)
+    elif len(available_female) >= 1:
+        selected_ids.extend(available_female)
+    
+    # If we don't have 5 yet, add more from available
+    remaining_needed = 5 - len(selected_ids)
+    remaining_actors = [id_ for id_ in available_male + available_female if id_ not in selected_ids]
+    if remaining_needed > 0 and remaining_actors:
+        additional = random.sample(remaining_actors, min(remaining_needed, len(remaining_actors)))
+        selected_ids.extend(additional)
+    
     selected_names = [actor_names[aid] for aid in selected_ids]
     print(f"Selected Actors: {', '.join(selected_names)}")
+    print(f"Selected IDs: {selected_ids}")
 
     # 2. Create Profiles
     # Initialize creator

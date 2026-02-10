@@ -97,7 +97,7 @@ def mix_audios(wav_paths, output_path, target_duration=15):
 def main():
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     META_PATH = os.path.join(BASE_DIR, "vox1_meta.csv")
-    WAV_ROOT = os.path.join(BASE_DIR, "vox_100_atores", "wav")
+    WAV_ROOT = os.path.join(BASE_DIR, "vox_300_atores", "wav")
     OUTPUT_DIR = os.path.join(BASE_DIR, "data", "demo")
 
     available_ids, actor_names = load_actors(META_PATH, WAV_ROOT)
@@ -106,31 +106,34 @@ def main():
         logging.error("Not enough actors found!")
         return
 
-    # Create mixes for 2, 3, 4, 5 speakers
+    # Modificado: Criar muitas misturas para cada número de speakers
+    num_tests_per_group = 50  # 50 testes para cada grupo (2,3,4,5 speakers) = 200 testes totais
+    
     for num_speakers in [2, 3, 4, 5]:
-        selected_ids = random.sample(available_ids, num_speakers)
-        wav_files = []
-        selected_names = []
+        for test_idx in range(num_tests_per_group):
+            selected_ids = random.sample(available_ids, num_speakers)
+            wav_files = []
+            selected_names = []
 
-        print(f"\n--- Mixing {num_speakers} Speakers ---")
-        for aid in selected_ids:
-            wav = get_random_wav(aid, WAV_ROOT)
-            if wav:
-                wav_files.append(wav)
-                name = actor_names[aid]
-                selected_names.append(name)
-                print(f"  - {name} ({aid}): {os.path.basename(wav)}")
-        
-        if len(wav_files) == num_speakers:
-            output_file = os.path.join(OUTPUT_DIR, f"mix_{num_speakers}_speakers.wav")
-            mix_audios(wav_files, output_file)
+            print(f"\n--- Mixing {num_speakers} Speakers (Test {test_idx+1}/{num_tests_per_group}) ---")
+            for aid in selected_ids:
+                wav = get_random_wav(aid, WAV_ROOT)
+                if wav:
+                    wav_files.append(wav)
+                    name = actor_names[aid]
+                    selected_names.append(name)
+                    print(f"  - {name} ({aid}): {os.path.basename(wav)}")
             
-            # Save ground truth
-            gt_file = os.path.join(OUTPUT_DIR, f"mix_{num_speakers}_ground_truth.txt")
-            with open(gt_file, "w") as f:
-                f.write(f"Speakers: {', '.join(selected_names)}\n")
-                for i, path in enumerate(wav_files):
-                    f.write(f"{selected_names[i]}: {path}\n")
+            if len(wav_files) == num_speakers:
+                output_file = os.path.join(OUTPUT_DIR, f"mix_{num_speakers}_speakers_test{test_idx+1}.wav")
+                mix_audios(wav_files, output_file)
+                
+                # Save ground truth
+                gt_file = os.path.join(OUTPUT_DIR, f"mix_{num_speakers}_ground_truth_test{test_idx+1}.txt")
+                with open(gt_file, "w") as f:
+                    f.write(f"Speakers: {', '.join(selected_names)}\n")
+                    for i, path in enumerate(wav_files):
+                        f.write(f"{selected_names[i]}: {path}\n")
 
 if __name__ == "__main__":
     main()

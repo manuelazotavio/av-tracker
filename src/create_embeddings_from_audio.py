@@ -99,44 +99,82 @@ def main():
         if args.speakers:
             speaker_dirs = [d for d in speaker_dirs if d.name in args.speakers]
 
-        # iterate speaker directories
-        for sp in speaker_dirs:
-            wavs = find_wavs(sp)
-            if not wavs:
-                continue
-            sampled = wavs if len(wavs) <= args.samples else random.sample(wavs, args.samples)
-            embs = []
-            for w in sampled:
+        # iterate speaker directories (default layout)
+        if speaker_dirs:
+            for sp in speaker_dirs:
+                wavs = find_wavs(sp)
+                if not wavs:
+                    continue
+                sampled = wavs if len(wavs) <= args.samples else random.sample(wavs, args.samples)
+                embs = []
+                for w in sampled:
+                    try:
+                        audio = load_audio(w, target_sr=16000, max_duration=args.segment)
+                        emb = compute_embedding(model, audio, device)
+                        embs.append(emb)
+                    except Exception as e:
+                        logger.warning(f'Failed to embed {w}: {e}')
+                if not embs:
+                    continue
+                avg_emb = np.mean(embs, axis=0)
+
+                metadata = {
+                    'created_at': datetime.datetime.now().strftime('%Y%m%d_%H%M%S'),
+                    'num_samples': len(embs),
+                    'sample_rate': 16000,
+                    'segment_duration': args.segment,
+                    'model_name': 'speechbrain/spkrec-ecapa-voxceleb'
+                }
+
+                profile = {
+                    'speaker_name': sp.name,
+                    'embedding': avg_emb,
+                    'metadata': metadata
+                }
+
+                fname = outdir / f"{sp.name}_{metadata['created_at']}.pkl"
+                with open(fname, 'wb') as f:
+                    pickle.dump(profile, f)
+
+                speakers_created += 1
+                logger.info(f'Created profile: {fname} ({len(embs)} samples)')
+        else:
+            # fallback: use audio files directly inside root as individual speakers
+            root_wavs = [p for p in rootp.iterdir() if p.is_file() and p.suffix.lower() in ('.wav', '.flac', '.m4a', '.mp3')]
+            if args.speakers:
+                root_wavs = [p for p in root_wavs if p.stem in args.speakers]
+
+            for w in sorted(root_wavs):
+                embs = []
                 try:
                     audio = load_audio(w, target_sr=16000, max_duration=args.segment)
                     emb = compute_embedding(model, audio, device)
                     embs.append(emb)
                 except Exception as e:
                     logger.warning(f'Failed to embed {w}: {e}')
-            if not embs:
-                continue
-            avg_emb = np.mean(embs, axis=0)
+                    continue
 
-            metadata = {
-                'created_at': datetime.datetime.now().strftime('%Y%m%d_%H%M%S'),
-                'num_samples': len(embs),
-                'sample_rate': 16000,
-                'segment_duration': args.segment,
-                'model_name': 'speechbrain/spkrec-ecapa-voxceleb'
-            }
+                avg_emb = np.mean(embs, axis=0)
+                metadata = {
+                    'created_at': datetime.datetime.now().strftime('%Y%m%d_%H%M%S'),
+                    'num_samples': len(embs),
+                    'sample_rate': 16000,
+                    'segment_duration': args.segment,
+                    'model_name': 'speechbrain/spkrec-ecapa-voxceleb'
+                }
 
-            profile = {
-                'speaker_name': sp.name,
-                'embedding': avg_emb,
-                'metadata': metadata
-            }
+                profile = {
+                    'speaker_name': w.stem,
+                    'embedding': avg_emb,
+                    'metadata': metadata
+                }
 
-            fname = outdir / f"{sp.name}_{metadata['created_at']}.pkl"
-            with open(fname, 'wb') as f:
-                pickle.dump(profile, f)
+                fname = outdir / f"{w.stem}_{metadata['created_at']}.pkl"
+                with open(fname, 'wb') as f:
+                    pickle.dump(profile, f)
 
-            speakers_created += 1
-            logger.info(f'Created profile: {fname} ({len(embs)} samples)')
+                speakers_created += 1
+                logger.info(f'Created profile: {fname} (1 sample)')
 
     logger.info(f'Done. Created {speakers_created} speaker profiles in {outdir}')
 

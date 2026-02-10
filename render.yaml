@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: av-tracker-dashboard
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python web_dashboard.py
+    envVars:
+      - key: FLASK_APP
+        value: web_dashboard.py
+      - key: FLASK_ENV
+        value: production

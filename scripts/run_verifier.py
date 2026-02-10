@@ -25,7 +25,7 @@ import sys
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.multi_speaker_verification import MultiSpeakerVerifier
+from src.multi_speaker_verifier import MultiSpeakerVerifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,7 +74,7 @@ def process_audio_files(
         logger.error(f"Failed to initialize verifier: {e}")
         sys.exit(1)
     
-    logger.info(f"Loaded {len(verifier.speakers)} speaker profiles")
+    logger.info(f"Loaded {len(verifier.embeddings)} speaker profiles")
     
     # Find all audio files
     pattern = "**/*.wav" if recursive else "*.wav"
@@ -100,7 +100,7 @@ def process_audio_files(
                 logger.warning(f"No results from {audio_file}")
                 results.append({
                     'file_path': str(audio_file.relative_to(input_path)),
-                    'speaker_count': len(verifier.speakers),
+                    'speaker_count': len(verifier.embeddings),
                     'chunks_processed': 0,
                     'identified_count': 0,
                     'unknown_count': 0,
@@ -132,7 +132,7 @@ def process_audio_files(
             
             result = {
                 'file_path': str(audio_file.relative_to(input_path)),
-                'speaker_count': len(verifier.speakers),
+                'speaker_count': len(verifier.embeddings),
                 'chunks_processed': len(verifications),
                 'identified_count': identified_count,
                 'unknown_count': unknown_count,
@@ -154,7 +154,7 @@ def process_audio_files(
             logger.error(f"Error processing {audio_file}: {e}")
             results.append({
                 'file_path': str(audio_file.relative_to(input_path)),
-                'speaker_count': len(verifier.speakers),
+                'speaker_count': len(verifier.embeddings),
                 'chunks_processed': 0,
                 'identified_count': 0,
                 'unknown_count': 0,
