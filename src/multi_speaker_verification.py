@@ -35,10 +35,23 @@ logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 logging.getLogger("pyannote").setLevel(logging.WARNING)
 
 class LargeMeetingTranscriber:
-    def __init__(self, verifier, hf_token, whisper_size="small", device="cuda", use_ai_analysis=True):
+    def __init__(
+        self,
+        verifier,
+        hf_token,
+        whisper_size="small",
+        device="cuda",
+        use_ai_analysis=True,
+        diarization_clustering_threshold=0.6,
+        verifier_confidence_min=0.8,
+        min_segment_duration=0.8,
+    ):
         self.verifier = verifier
         self.device = device
         self.use_ai_analysis = use_ai_analysis
+        self.diarization_clustering_threshold = diarization_clustering_threshold
+        self.verifier_confidence_min = verifier_confidence_min
+        self.min_segment_duration = min_segment_duration
         
         logger.info("Autenticando...")
         login(token=hf_token)
@@ -77,6 +90,19 @@ class LargeMeetingTranscriber:
             "pyannote/speaker-diarization-3.1",
             use_auth_token=hf_token
         ).to(torch.device(device))
+
+        if self.diarization_clustering_threshold is not None:
+            try:
+                self.pipeline.instantiate({
+                    "clustering": {"threshold": self.diarization_clustering_threshold},
+                    "segmentation": {"threshold": 0.4}  # Reduz threshold de segmentação
+                })
+                logger.info(
+                    f"✅ Clustering threshold ajustado: {self.diarization_clustering_threshold}"
+                )
+                logger.info("✅ Segmentation threshold ajustado: 0.4")
+            except Exception as e:
+                logger.warning(f"⚠️ Falha ao ajustar thresholds: {e}")
 
         # Evita erro de symlink no Windows durante download do modelo
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
@@ -166,10 +192,10 @@ class LargeMeetingTranscriber:
             conversation_text += f"{speaker}: {text}\n"
         
         # Prompt para o LLM
-        prompt = f"""Analyze this Portuguese conversation and identify the REAL HUMAN NAME of each speaker.
+        prompt = f"""Analyze this English conversation and identify the REAL HUMAN NAME of each speaker.
 
 IMPORTANT RULES:
-- Only extract actual person names (Brazilian names like Lucas, Maria, João, Ana, etc.)
+- Only extract actual person names 
 - IGNORE programming languages (Kotlin, Java, Python, etc.)
 - IGNORE technical terms, frameworks, or companies
 - IGNORE product names or technologies
@@ -384,7 +410,7 @@ Answer (only list speakers with confirmed human names):"""
             logger.info(f"\n✅ {saved_count} novo(s) embedding(s) criado(s) com sucesso!")
             logger.info("🔄 Reinicie o sistema para carregar os novos embeddings.")
 
-    def process_audio(self, audio_path, embeddings_dir=None):
+    def process_audio(self, audio_path, embeddings_dir=None, num_speakers=None):
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Arquivo não encontrado: {audio_path}")
         
@@ -392,6 +418,8 @@ Answer (only list speakers with confirmed human names):"""
         start_total = time.time()
         logger.info(f"\n{'='*60}")
         logger.info(f"Processando: {audio_path}")
+        if num_speakers:
+            logger.info(f"Limitando para MÁXIMO {num_speakers} speaker(s)")
         logger.info(f"{'='*60}")
         
         # 1. Carregamento de áudio
@@ -402,7 +430,13 @@ Answer (only list speakers with confirmed human names):"""
         
         # 2. Diarização
         start = time.time()
-        diarization = self.pipeline(audio_path)
+        # Configura parâmetros de diarização baseado no número de speakers
+        diarization_params = {}
+        if num_speakers:
+            diarization_params['min_speakers'] = num_speakers
+            diarization_params['max_speakers'] = num_speakers
+        
+        diarization = self.pipeline(audio_path, **diarization_params)
         overlap_timeline = diarization.get_overlap()
         elapsed = time.time() - start
         logger.info(f"✅ Diarização (identificação de speakers): {elapsed:.2f}s")
@@ -426,8 +460,10 @@ Answer (only list speakers with confirmed human names):"""
         for turn, _, speaker_id in diarization.itertracks(yield_label=True):
             duration = turn.end - turn.start
             
-            if duration < 0.5:
-                logger.debug(f"⏭️ [{turn.start:.1f}s] Segmento muito curto ({duration:.2f}s), pulando...")
+            if duration < self.min_segment_duration:
+                logger.debug(
+                    f"⏭️ [{turn.start:.1f}s] Segmento muito curto ({duration:.2f}s), pulando..."
+                )
                 continue
             
             # Limita segmentos muito longos para evitar travamento
@@ -508,7 +544,12 @@ Answer (only list speakers with confirmed human names):"""
                 if is_overlap:
                     print(f"    [DEBUG] Voz {idx+1}: {real_name} ({conf:.1%})")
 
-                disp = real_name if real_name != "Unknown" else speaker_id
+                verified_name = None
+                if real_name != "Unknown" and conf >= self.verifier_confidence_min:
+                    verified_name = real_name
+
+                disp = speaker_id
+                display_label = disp if not verified_name else f"{disp} ({verified_name})"
                 
                 try:
                     # Normaliza áudio antes de transcrever
@@ -526,7 +567,7 @@ Answer (only list speakers with confirmed human names):"""
                     start_whisper = time.time()
                     segs, _ = self.whisper.transcribe(
                         audio_for_whisper, 
-                        language="pt", 
+                        language="en", 
                         beam_size=1,
                         vad_filter=False,
                         without_timestamps=True
@@ -566,11 +607,12 @@ Answer (only list speakers with confirmed human names):"""
                     speaker_history[disp] = {'clean_text': clean_new, 'time': turn.start}
 
                     suffix = f" (Voz {idx+1})" if is_overlap else ""
-                    logger.debug(f"✅ [{turn.start:.1f}s] {disp}{suffix}: TRANSCRITO")
-                    print(f" [{turn.start:.1f}s] {disp}{suffix}: {text}")
+                    logger.debug(f"✅ [{turn.start:.1f}s] {display_label}{suffix}: TRANSCRITO")
+                    print(f" [{turn.start:.1f}s] {display_label}{suffix}: {text}")
                     
                     full_transcript.append({
                         "speaker": disp,
+                        "verified_name": verified_name,
                         "text": text,
                         "start": turn.start,
                         "suffix": suffix
@@ -637,8 +679,14 @@ if __name__ == "__main__":
 
     print("Inicializando...")
     try:
-        verifier = MultiSpeakerVerifier(embeddings_dir, threshold=0.55)
-        system = LargeMeetingTranscriber(verifier, HF_TOKEN)
+        verifier = MultiSpeakerVerifier(embeddings_dir, threshold=0.65)
+        system = LargeMeetingTranscriber(
+            verifier,
+            HF_TOKEN,
+            diarization_clustering_threshold=0.45,
+            verifier_confidence_min=0.9,
+            min_segment_duration=0.6,
+        )
 
         while True:
             f = input("\nArquivo: ").strip()
@@ -647,7 +695,16 @@ if __name__ == "__main__":
             path = f if os.path.exists(f) else f"../data/testes/{f}"
             
             if os.path.exists(path):
-                transcript_result = system.process_audio(path, embeddings_dir)
+                # Pergunta número de speakers (opcional)
+                num_speakers_input = input("Número MÁXIMO de speakers (Enter para detectar automaticamente): ").strip()
+                num_speakers = None
+                if num_speakers_input.isdigit():
+                    num_speakers = int(num_speakers_input)
+                    print(f"✅ Limitando para máximo {num_speakers} speaker(s)")
+                else:
+                    print("✅ Detecção automática de speakers")
+                
+                transcript_result = system.process_audio(path, embeddings_dir, num_speakers=num_speakers)
                 
                 base_name = os.path.splitext(os.path.basename(path))[0]
                 output_filename = f"{base_name}_transcricao.txt"
@@ -661,9 +718,13 @@ if __name__ == "__main__":
                         for line in transcript_result:
                             timestamp = f"[{line['start']:.1f}s]"
                             speaker = line['speaker']
+                            verified_name = line.get('verified_name')
                             suffix = line.get('suffix', '')
                             text = line['text']
-                            txt_file.write(f"{timestamp} {speaker}{suffix}: {text}\n")
+                            if verified_name:
+                                txt_file.write(f"{timestamp} {speaker} ({verified_name}){suffix}: {text}\n")
+                            else:
+                                txt_file.write(f"{timestamp} {speaker}{suffix}: {text}\n")
                     
                     print(f"Arquivo '{output_filename}' salvo com sucesso!")
                 else:
