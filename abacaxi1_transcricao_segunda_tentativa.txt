@@ -1,0 +1,22 @@
+ARQUIVO: C:\Users\manue\av-tracker\data\demo\abacaxi1.wav
+--------------------------------------------------
+
+[32.0s] SPEAKER_01 (Voz 1): Então, é isso aí.  Até a próxima.  Tchau.
+[32.0s] SPEAKER_01 (Voz 2): É isso aí, Sérgio.  Até a próxima.
+[50.0s] SPEAKER_01 (Voz 1): É tão constante.  Então...
+[50.0s] SPEAKER_01 (Voz 2): Pode, com certeza. Eu vejo abacaxi como protesto também.
+[50.4s] SPEAKER_00 (Voz 1): É tão contente...
+[50.4s] SPEAKER_00 (Voz 2): Com certeza, eu vi.
+[100.2s] SPEAKER_00 (Voz 1): E agradece.
+[100.2s] SPEAKER_00 (Voz 2): Foi um prazer.
+[100.4s] SPEAKER_01 (Voz 1): que a galera te tirou meio pássaro.
+[100.4s] SPEAKER_01 (Voz 2): Foi isso também que eu...
+[101.6s] SPEAKER_00 (Voz 1): que a galera te tirou meio pra Srta. Moreira.
+[101.6s] SPEAKER_00 (Voz 2): Quem criou...  É o Marcelo, né?
+[111.5s] SPEAKER_00 (Voz 1): Não acontece isso.
+[111.5s] SPEAKER_00 (Voz 2): Mas aí eu já...
+[162.1s] SPEAKER_01 (Voz 1): Tá, então...
+[162.1s] SPEAKER_01 (Voz 2): Tá bem, hein, Nihon?
+[178.0s] SPEAKER_00 (Voz 1): Tinha uma rejeita aí pra mostrar o nome.
+[178.0s] SPEAKER_00 (Voz 2): Pô...  Não...
+[179.4s] SPEAKER_01 (Voz 2): Não, mas eu não retifiquei ainda.  Não há muita luz.

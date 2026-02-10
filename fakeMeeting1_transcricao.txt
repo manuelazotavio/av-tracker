@@ -1,0 +1,43 @@
+ARQUIVO: C:\Users\manue\av-tracker\data\demo\fakeMeeting1.wav
+--------------------------------------------------
+
+[0.0s] SPEAKER_01: Alright team.
+[1.8s] SPEAKER_01: It's time to dive into our sprint meeting. We're getting closer to the release date, so let's ensure everything is on track.
+[7.8s] SPEAKER_02: Yes, we're making progress, but there are some pressing issues that need immediate attention.
+[13.0s] SPEAKER_02: The authentication process is acting up. Users are experiencing a logon failures.
+[18.3s] SPEAKER_01: I've been looking into that too. Seems like a token management issue.
+[22.9s] SPEAKER_02: can confirm. We've got multiple instances where the authentication flow breaks.
+[28.2s] SPEAKER_01: that's a priority.
+[30.1s] SPEAKER_01: Let's highlight it on our board any other critical points to address today.
+[34.3s] SPEAKER_02: Our UI redesign is nearly done, but feedback on the color schemes isn't entirely positive.
+[40.4s] SPEAKER_02: I've sketched some alternate colour palettes based on the feedback.
+[43.9s] SPEAKER_02: I'll screen share them.
+[45.5s] SPEAKER_02: Tweaking colors won't be a massive oval, but we need to ensure consistency throughout the UE elements.
+[52.2s] SPEAKER_01: great.
+[53.2s] SPEAKER_01: We'll task that but won't this affect our authentication fix?
+[56.8s] SPEAKER_03: The UI matters too. We can't afford to neglect that aspect either.
+[61.5s] SPEAKER_01: good point. Let's weigh the impact on our release deadline for each issue.
+[66.6s] SPEAKER_02: A smooth release is key. We need to address both authentication and UI issues.
+[72.0s] SPEAKER_01: We can split tasks among the team to handle both simultaneously.
+[76.9s] SPEAKER_02: True, but we need smooth communication to resolve these issues efficiently.
+[81.7s] SPEAKER_01: Agreed. We'll assign tasks and ensure collaboration between devs and testers.
+[87.4s] SPEAKER_00: I'll refine the colour schemes and circulate them for review.
+[90.9s] SPEAKER_00: Mr. Juan, George and I will tackle the authentication bugs head on.
+[96.1s] SPEAKER_01: Let's reconvene tomorrow to review progress. Keep up the good work team.
+[100.5s] SPEAKER_02: got it. Let's make sure we're set for a successful release.
+[104.0s] SPEAKER_01: Absolutely.
+[105.5s] SPEAKER_01: Thanks everyone, until tomorrow then.
+[108.1s] SPEAKER_01: Let's start by reviewing our progress from yesterday and plan our next steps.
+[112.8s] SPEAKER_02: We made some headway on both the authentication issue and the UI adjustments. However, there are still some unresolved aspects.
+[120.3s] SPEAKER_00: Yeah, we fixed a few bugs in the authentication flow, but there are still edge cases causing trouble.
+[126.3s] SPEAKER_02: agreed, I've identified a couple of scenarios that need further testing.
+[130.8s] SPEAKER_01: Okay, let's update the board with the progress made so far.
+[134.4s] SPEAKER_01: and note the areas that still need attention.
+[137.2s] SPEAKER_02: I refined the colour schemes based on the team's feedback. Take a look at these updated designs.
+[142.9s] SPEAKER_02: The new color palettes look more in line with what the users might prefer, but integrating them seamlessly might take a bit more time.
+[152.4s] SPEAKER_01: Let's ensure consistency and check how it affects our timeline.
+[156.7s] SPEAKER_03: The UI changes are necessary, but we must ensure they don't delay the authentication fixes.
+[162.7s] SPEAKER_03: Great.
+[164.0s] SPEAKER_02: Priority is a balanced approach that doesn't compromise our release date.
+[168.6s] SPEAKER_01: Absolutely.
+[170.2s] SPEAKER_01: Let's discuss how we can streamline efforts to maintain our schedule. Any suggestions? Perhaps we could assign specific time slots for UI adjustments and dedicated time for our
