@@ -8,7 +8,7 @@ import torchaudio.transforms as T
 from pyannote.audio import Pipeline
 from faster_whisper import WhisperModel
 from speechbrain.inference.separation import SepformerSeparation
-from multi_speaker_verifier import MultiSpeakerVerifier
+from .multi_speaker_verifier import MultiSpeakerVerifier
 from huggingface_hub import login, snapshot_download
 from difflib import SequenceMatcher
 from collections import defaultdict
@@ -25,7 +25,7 @@ torch.serialization.add_safe_globals([
     Resolution
 ])
 
-HF_TOKEN = "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"
+HF_TOKEN = "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"
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -87,8 +87,7 @@ class LargeMeetingTranscriber:
 
         logger.info("Carregando PyAnnote...")
         self.pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token
+            "pyannote/speaker-diarization-3.1"
         ).to(torch.device(device))
 
         if self.diarization_clustering_threshold is not None:
@@ -567,7 +566,7 @@ Answer (only list speakers with confirmed human names):"""
                     start_whisper = time.time()
                     segs, _ = self.whisper.transcribe(
                         audio_for_whisper, 
-                        language="en", 
+                        language="pt", 
                         beam_size=1,
                         vad_filter=False,
                         without_timestamps=True

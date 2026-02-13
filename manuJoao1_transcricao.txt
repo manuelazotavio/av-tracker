@@ -1,0 +1,86 @@
+ARQUIVO: C:\Users\manue\av-tracker\data\demo\manuJoao1.wav
+--------------------------------------------------
+
+[1.3s] SPEAKER_01: Não é, não é, não é. Se tu nem o que você está hoje.
+[3.9s] SPEAKER_00: Oi João, tudo bem?
+[5.5s] SPEAKER_00: É... também você.
+[7.7s] SPEAKER_01: Eu estou um pouco cansado, trabalhei demais hoje.
+[10.1s] SPEAKER_00: O que você fez hoje?
+[11.8s] SPEAKER_01: Hoje eu acordei e fiz duas cioninhas em uma parte da manhã.
+[15.1s] SPEAKER_00: Eu não sei o que falar, mas eu não tô com o sino escutando.
+[17.3s] SPEAKER_01: Bom, hoje é a partir da manhã, eu realizei algumas atividades e realizei dois reuniões. Na parte do almoço tive que ir ao centro.
+[24.4s] SPEAKER_01: Na parte da tarde, eu continuei realizando meus projetos, fiz algumas exprimições.
+[29.5s] SPEAKER_01: Algumas das tésicas que precisava fazer.
+[32.3s] SPEAKER_01: Isso consumiu bastante coisa, é bastante do meu ser.
+[35.7s] SPEAKER_01: Eu estou cansado.
+[37.6s] SPEAKER_00: Agençado.
+[39.9s] SPEAKER_00: Eu também estou cansada.
+[41.9s] SPEAKER_00 (Voz 1): O que você fez?
+[41.9s] SPEAKER_00 (Voz 2): Não me diga...
+[42.7s] SPEAKER_01 (Voz 1): Perfeinado.
+[44.4s] SPEAKER_01: Ui, que isso está cansado.
+[46.0s] SPEAKER_00: Eu realmente não fiz nada.
+[49.4s] SPEAKER_00: Mas eu me cansei.
+[52.0s] SPEAKER_00: porque eu não dormi direito.
+[54.2s] SPEAKER_01: Por que você não dormiu direito?
+[55.3s] SPEAKER_00: porque tinha uma... lisma
+[58.6s] SPEAKER_00: Mas, Manoma...
+[61.4s] SPEAKER_01: E eu me cheio.
+[62.2s] SPEAKER_00: Não!
+[63.6s] SPEAKER_00: Um... um... Come, charme!
+[65.6s] SPEAKER_01: Uma capivara.
+[67.3s] SPEAKER_00: Seja todo mundo!
+[69.5s] SPEAKER_01: Esse simbio de basquete da hora, mano.
+[73.0s] SPEAKER_00: Como que chama?
+[74.8s] SPEAKER_00: uma larva no meu ouvido.
+[78.0s] SPEAKER_00: e aí, eu não consegui dormir direto, passar de tarde com o sonho.
+[82.0s] SPEAKER_01: O que é isso?
+[82.9s] SPEAKER_00: E eu dormi bastante, bem gostoso.
+[87.8s] SPEAKER_01: o Thor é o melhor personagem de Vingadores.
+[92.0s] SPEAKER_00: É... qual é o seu favorito?
+[95.1s] SPEAKER_01: Lillas.
+[97.5s] SPEAKER_00: Não é, sou mentirosa, essa minha é a cor favorita.
+[100.2s] SPEAKER_01: Não, vem me demirar por favor.
+[102.3s] SPEAKER_00: Nunca vi você fazendo nada com vermelho.
+[104.4s] SPEAKER_01: Mais magenta, né, pessoal?
+[106.1s] SPEAKER_00: Você nunca falou... Você nem sabe que cor é magenta.
+[109.0s] SPEAKER_01: Eu tô pensando em uma cor difícil para o modelo não adivinhar a cor brasileira.
+[113.4s] SPEAKER_01: Deixa eu ver outra coisa difícil.
+[116.0s] SPEAKER_01: Tom carmezinho da luz dourada.
+[118.1s] SPEAKER_00 (Voz 1): Uhum.
+[118.1s] SPEAKER_00 (Voz 2): Oh!
+[118.6s] SPEAKER_01 (Voz 1): Quero ver isso a ver.
+[118.6s] SPEAKER_01 (Voz 2): Samus.
+[123.4s] SPEAKER_00: Qual o seu filme favorito?
+[124.8s] SPEAKER_01: Seu dragão 2
+[129.8s] SPEAKER_00 (Voz 1): Não, não.
+[129.8s] SPEAKER_00 (Voz 2): Como que é em Glee?
+[129.8s] SPEAKER_01 (Voz 1): Deixem-se com seu dragão.
+[129.8s] SPEAKER_01 (Voz 2): Como que é inglês?
+[132.9s] SPEAKER_00: Calma, fala mais devagar.
+[134.7s] SPEAKER_01: Como se o seu dragão...
+[136.7s] SPEAKER_00: Como ser um dragão?
+[138.1s] SPEAKER_01: How to Drag? Como treinar o seu dragão?
+[140.8s] SPEAKER_00: Como um dragão?
+[142.9s] SPEAKER_01: Trainhe seu dragão.
+[144.4s] SPEAKER_00: Há um trem.
+[145.8s] SPEAKER_01 (Voz 1): Prontinho, tá?
+[145.8s] SPEAKER_01 (Voz 2): Obrigado.
+[146.6s] SPEAKER_00: Fala tudo de novo.
+[150.5s] SPEAKER_01: como treinar. Outrain.
+[153.6s] SPEAKER_01: E... ar... drag... brago.
+[156.7s] SPEAKER_00: Tá voltando uma coisa, uma preposição.
+[163.3s] SPEAKER_01: para treinar o seu sonho.
+[166.6s] SPEAKER_00: Muito bem! Parabéns!
+[168.3s] SPEAKER_01 (Voz 1): Hã?
+[170.5s] SPEAKER_01: Será que o mandeiro vai identificar tudo isso?
+[173.1s] SPEAKER_01: Pós a expectativa.
+[174.9s] SPEAKER_00: uma expectativa.
+[176.8s] SPEAKER_00: que ele vai acertar tudo.
+[179.2s] SPEAKER_01: Meu Deus, associa a prefeitura de todos os...
+[182.4s] SPEAKER_01 (Voz 1): Vá se vencer, vá se vencer.
+[182.4s] SPEAKER_01 (Voz 2): Fátima, é só...
+[182.7s] SPEAKER_00 (Voz 1): Então, está mais tempo, né?
+[182.7s] SPEAKER_00 (Voz 2): Pode falar, é só pra eu conhecer ele.
+[185.7s] SPEAKER_00: A gente falando junto, vai?
+[187.0s] SPEAKER_01: Ah, peraí, meu, vamos separar aqui.
