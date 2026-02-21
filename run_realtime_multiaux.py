@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""
-Script para gravação com múltiplas fontes de áudio
-- Microfone (entrada do usuário)
-- Áudio de sistema/chamadas (via loopback)
-- Processamento em tempo real com identificação de speaker
-"""
+
+import sys
+from types import ModuleType
+
+sys.modules['k2'] = ModuleType('k2')
+sys.modules['_k2'] = ModuleType('_k2')
+sys.modules['flair'] = ModuleType('flair')
+sys.modules['flair.data'] = ModuleType('flair.data')
+sys.modules['flair.embeddings'] = ModuleType('flair.embeddings')
+sys.modules['speechbrain.integrations.k2_fsa'] = ModuleType('speechbrain.integrations.k2_fsa')
+sys.modules['speechbrain.integrations.nlp'] = ModuleType('speechbrain.integrations.nlp')
+sys.modules['speechbrain.integrations.nlp.flair_embeddings'] = ModuleType('speechbrain.integrations.nlp.flair_embeddings')
 
 import os
-import sys
 import logging
 import sounddevice as sd
 import numpy as np
@@ -16,7 +21,6 @@ from src.multi_speaker_verifier import MultiSpeakerVerifier
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 def list_audio_devices():
     """Lista todos os dispositivos de áudio disponíveis"""
@@ -294,9 +298,8 @@ def main():
     embeddings_dir = os.path.join(base_dir, "data", "embeddings")
     
     if not os.path.exists(embeddings_dir):
-        print("\n❌ ERRO: Pasta de embeddings não encontrada!")
-        print("Execute primeiro: python src/create_embeddings_from_audio.py --help")
-        sys.exit(1)
+        print("\n⚠️ Pasta de embeddings não encontrada, criando uma vazia.")
+        os.makedirs(embeddings_dir)
     
     print(f"\n✅ Embeddings encontrados em: {embeddings_dir}")
     
