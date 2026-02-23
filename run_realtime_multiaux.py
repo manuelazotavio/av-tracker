@@ -19,7 +19,7 @@ import numpy as np
 from src.realtime_transcriber import RealtimeTranscriber
 from src.multi_speaker_verifier import MultiSpeakerVerifier
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 def list_audio_devices():
@@ -85,7 +85,7 @@ def create_multi_source_recorder(verifier, hf_token, mic_device=None, system_dev
         verifier,
         hf_token,
         whisper_size=whisper_size,
-        device="cpu",
+        device="cuda",
         **kwargs
     )
     
@@ -156,36 +156,46 @@ def record_multi_source(recorder, embeddings_dir):
         return _callback
 
     def _open_input_stream(device, label, callback, loopback=False):
+        # 1. Busca as informações reais do dispositivo selecionado
+        try:
+            device_info = sd.query_devices(device)
+            # Usa o samplerate nativo do dispositivo
+            native_samplerate = device_info.get("default_samplerate", recorder.sample_rate)
+            # Lê o número máximo de canais de entrada que o dispositivo suporta
+            native_channels = int(device_info.get("max_input_channels", 1))
+        except Exception as e:
+            logger.warning(f"⚠️ {label}: Não foi possível ler as info do dispositivo {device}. Usando padrão.")
+            native_samplerate = recorder.sample_rate
+            native_channels = 1
+        
+        # Limita para 1 ou 2 canais para evitar erros com headsets bizarros (como 3 canais)
+        if native_channels > 2:
+            native_channels = 2
+
         stream_kwargs = dict(
-            channels=1,
-            samplerate=recorder.sample_rate,
-            blocksize=int(recorder.sample_rate * 0.1),
+            channels=native_channels,
+            samplerate=native_samplerate,
+            blocksize=int(native_samplerate * 0.1),
             dtype=np.float32,
             callback=callback,
         )
-        extra_settings = _build_wasapi_settings(loopback)
-        if loopback and extra_settings is None:
-            logger.warning("⚠️ Loopback indisponivel: capture de sistema pode nao funcionar")
-        if extra_settings is not None:
-            stream_kwargs["extra_settings"] = extra_settings
+
         try:
             return sd.InputStream(device=device, **stream_kwargs)
         except Exception as e:
-            if device is None:
-                raise
-            logger.warning(f"⚠️ {label}: falha ao abrir dispositivo {device}. Tentando padrão. Erro: {e}")
+            logger.warning(f"⚠️ {label}: falha ao abrir dispositivo {device} com as configurações nativas. Tentando padrão seguro. Erro: {e}")
+            
+            # Fallback seguro: API padrão (MME/DirectSound), 1 canal, e deixa o Python escolher o sample rate.
+            fallback_kwargs = dict(
+                channels=1,
+                dtype=np.float32,
+                callback=callback,
+            )
             try:
-                return sd.InputStream(device=None, **stream_kwargs)
-            except Exception:
-                # Fallback: tenta samplerate padrao do dispositivo
-                try:
-                    info = sd.query_devices(device)
-                    stream_kwargs["samplerate"] = info.get("default_samplerate", recorder.sample_rate)
-                    stream_kwargs["blocksize"] = None
-                    logger.warning("⚠️ %s: tentando samplerate padrao do dispositivo", label)
-                    return sd.InputStream(device=device, **stream_kwargs)
-                except Exception:
-                    raise
+                return sd.InputStream(device=None, **fallback_kwargs)
+            except Exception as e2:
+                logger.error(f"❌ Erro fatal ao tentar abrir fluxo de áudio seguro: {e2}")
+                raise
 
     # Thread para capturar microfone
     def capture_microphone():
