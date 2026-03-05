@@ -78,7 +78,6 @@ class LargeMeetingTranscriber:
             logger.info("Carregando LLM para análise contextual...")
             try:
                 self.llm = hf_pipeline(
-                    "text2text-generation",
                     model="google/flan-t5-small",
                     device=0 if device == "cuda" else -1,
                     max_length=512

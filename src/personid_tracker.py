@@ -1,630 +1,360 @@
-#!/usr/bin/env python3
-"""
-Complete Head Tracker with Name Display
-=======================================
-
-Integrated system combining:
-- YOLO head detection (YOLOv5/YOLOv11 support)
-- ByteTrack motion tracking
-- EdgeFace ReID (temporal matching)
-- Visual profile database (identity matching)
-- Name display for known persons
-
-Features:
-- Stable tracking IDs across occlusions
-- Person identification from database
-- Display actual names for known people
-- Frame buffer storage per person
-- ID reuse system
-
-Created: November 12, 2025
-Updated: November 13, 2025 - Added YOLOv11 support
-"""
-
-import cv2
-import numpy as np
-import torch
-import torch.nn.functional as F
-import pickle
-import queue
-import threading
+import os
 import logging
-import signal
-import time
-from pathlib import Path
-from collections import deque
-from typing import Dict, List, Optional, Tuple
-from scipy.spatial.distance import cosine
-
+import cv2
+import torch
+import torch.nn as nn
+import timm
+import numpy as np
 from boxmot import ByteTrack
-from yolo_detector import YOLODetector
+from pathlib import Path
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, 
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("tracker_debug.log")
-    ]
-)
 logger = logging.getLogger(__name__)
 
 
-class EdgeFaceEmbedder:
-    """EdgeFace embedding extractor"""
-    
-    def __init__(self, variant_or_path='edgeface_xxs', device='mps', use_torchhub=True):
-        self.device = torch.device(device)
-        self.input_size = (112, 112)
-        
-        if use_torchhub and isinstance(variant_or_path, str) and not variant_or_path.endswith('.pt'):
-            logging.info(f"Loading EdgeFace '{variant_or_path}' from torch.hub")
-            self.model = torch.hub.load(
-                'otroshi/edgeface', 
-                variant_or_path, 
-                source='github', 
-                pretrained=True,
-                trust_repo=True
-            )
-        else:
-            raise NotImplementedError("Local file loading - use torch.hub instead")
-        
-        self.model.to(self.device)
-        self.model.eval()
-        
-        if str(self.device) == 'mps':
-            self._register_contiguous_hooks()
-    
-    def _register_contiguous_hooks(self):
-        def make_contiguous_hook(module, input, output):
-            if isinstance(output, torch.Tensor) and not output.is_contiguous():
-                return output.contiguous()
-            return output
-        
-        for name, module in self.model.named_modules():
-            if isinstance(module, torch.nn.Conv2d):
-                module.register_forward_hook(make_contiguous_hook)
-    
-    def preprocess(self, face_crops):
-        if len(face_crops) == 0:
-            return torch.empty((0, 3, 112, 112), device=self.device)
-        
-        processed = []
-        for crop in face_crops:
-            resized = cv2.resize(crop, self.input_size, interpolation=cv2.INTER_LINEAR)
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            normalized = (rgb.astype(np.float32) - 127.5) / 127.5
-            chw = np.transpose(normalized, (2, 0, 1))
-            chw = np.ascontiguousarray(chw)
-            processed.append(chw)
-        
-        batch = np.stack(processed, axis=0)
-        batch = np.ascontiguousarray(batch)
-        tensor = torch.from_numpy(batch).to(self.device)
-        tensor = tensor.contiguous()
-        
-        return tensor
-    
-    def extract_embeddings(self, face_crops):
-        if len(face_crops) == 0:
-            return np.array([])
-        
-        batch = self.preprocess(face_crops)
-        
-        with torch.no_grad():
-            embeddings = self.model(batch)
-            embeddings = embeddings.contiguous()
-            embeddings = F.normalize(embeddings, p=2, dim=1)
-        
-        return embeddings.cpu().numpy()
+class _EdgeFaceXXS(nn.Module):
+    """Minimal wrapper matching TimmFRWrapperV2 from otroshi/edgeface."""
+    def __init__(self):
+        super().__init__()
+        self.model = timm.create_model('edgenext_xx_small')
+        self.model.reset_classifier(512)
+
+    def forward(self, x):
+        return self.model(x)
 
 
-class VisualProfileDatabase:
-    """Database of known persons from visual profiles"""
-    
-    def __init__(self, profiles_dir: str = "data/visual_embeddings"):
-        self.profiles_dir = Path(profiles_dir)
-        self.known_persons: Dict[str, np.ndarray] = {}  # {name: average_embedding}
-        
-        if not self.profiles_dir.exists():
-            logger.warning(f"Profiles directory not found: {self.profiles_dir}")
+class PersonIDTracker:
+    MATCH_THRESHOLD = 0.45  # cosine similarity to consider a known person
+    MERGE_THRESHOLD = 0.35  # threshold for merging during auto-enrollment
+    ENROLL_FRAMES = 50      # frames to accumulate (~5s) for more stable average embedding
+    CONFIRM_FRAMES = 4      # consecutive frames needed to confirm a known-name assignment
+
+    def __init__(self, model_path="od_model/edgeface_xxs.pt", device="cuda"):
+        self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
+        self.tracker = ByteTrack(track_buffer=90)  # ~3s at 30fps before track dies
+        net = _EdgeFaceXXS()
+        state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+        net.load_state_dict(state_dict)
+        self.model = net.to(self.device).eval()
+        self.known_embeddings = {}   # name -> np.array (512,)
+        self.emb_dir = None
+
+        # Auto-enrollment state
+        self._track_buffer = {}      # track_id -> list of embeddings
+        self._track_to_name = {}     # track_id -> assigned name (confirmed)
+        self._person_counter = 0
+        self._persist_fail_count = {}  # track_id -> consecutive persist failures
+        self._name_confirm = {}      # track_id -> {"name": str, "count": int}
+
+    def load_known_embeddings(self, emb_dir):
+        self.emb_dir = emb_dir
+        if not os.path.exists(emb_dir):
             return
-        
-        self._load_all_profiles()
-    
-    def _load_all_profiles(self):
-        """Load all visual profiles"""
-        profile_files = list(self.profiles_dir.glob("*.pkl"))
-        
-        logger.info(f"Loading profiles from {self.profiles_dir}")
-        
-        for profile_file in profile_files:
-            try:
-                with open(profile_file, 'rb') as f:
-                    data = pickle.load(f)
-                
-                person_name = data['person_name']
-                
-                if 'average_embedding' in data:
-                    embedding = data['average_embedding']
-                elif 'embeddings' in data and len(data['embeddings']) > 0:
-                    embedding = np.mean(data['embeddings'], axis=0)
+        self._emb_files = {}  # name -> filename on disk (for consolidation cleanup)
+        for file in os.listdir(emb_dir):
+            if file.endswith(".npy"):
+                base = file[:-4]  # remove .npy
+                if base.endswith("_auto"):
+                    name = base[:-5]  # "Person_1_auto" -> "Person_1"
                 else:
-                    continue
-                
-                self.known_persons[person_name] = embedding
-                logger.info(f"Loaded profile: {person_name}")
-                
-            except Exception as e:
-                logger.error(f"Failed to load {profile_file}: {e}")
-        
-        logger.info(f"Loaded {len(self.known_persons)} profiles")
-    
-    def identify_person(self, embedding: np.ndarray, threshold: float = 0.6) -> Tuple[Optional[str], float]:
-        """Identify person from embedding"""
-        if len(self.known_persons) == 0:
-            return None, 0.0
-        
-        best_match = None
-        best_similarity = 0.0
-        
-        for name, known_embedding in self.known_persons.items():
-            similarity = 1 - cosine(embedding, known_embedding)
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_match = name
-        
-        if best_similarity >= threshold:
-            return best_match, best_similarity
-        else:
-            return None, best_similarity
-
-
-class TrackedPerson:
-    """Represents a tracked person"""
-    
-    def __init__(self, track_id, bbox, embedding=None, frame_buffer_size=25):
-        self.track_id = track_id
-        self.bbox = bbox
-        self.embedding = embedding
-        self.embeddings_history = deque(maxlen=30)
-        if embedding is not None:
-            self.embeddings_history.append(embedding)
-        
-        self.frame_buffer = deque(maxlen=frame_buffer_size)
-        
-        self.last_seen = time.time()
-        self.frames_alive = 1
-        self.matched_this_frame = False
-        self.total_frames_tracked = 1
-        
-        # Identity information
-        self.identified_name: Optional[str] = None
-        self.identification_confidence: float = 0.0
-    
-    def update(self, bbox, embedding=None, face_crop=None):
-        self.bbox = bbox
-        self.last_seen = time.time()
-        self.frames_alive += 1
-        self.total_frames_tracked += 1
-        self.matched_this_frame = True
-        
-        if embedding is not None:
-            self.embeddings_history.append(embedding)
-            self.embedding = np.mean(list(self.embeddings_history), axis=0)
-        
-        if face_crop is not None:
-            self.frame_buffer.append({
-                'crop': face_crop.copy(),
-                'bbox': bbox,
-                'timestamp': time.time()
-            })
-    
-    def set_identity(self, name: Optional[str], confidence: float):
-        """Set identified name and confidence"""
-        self.identified_name = name
-        self.identification_confidence = confidence
-    
-    def get_display_name(self) -> str:
-        """Get name to display on screen"""
-        if self.identified_name:
-            return f"{self.identified_name} ({self.identification_confidence:.2f})"
-        else:
-            return f"Person {self.track_id}"
-    
-    def get_average_embedding(self):
-        if len(self.embeddings_history) == 0:
-            return None
-        return np.mean(list(self.embeddings_history), axis=0)
-
-
-class ROI:
-    def __init__(self, x1, y1, x2, y2, confidence=0, class_id=0, track_id=None):
-        self.x1 = int(max(0, x1))
-        self.y1 = int(max(0, y1))
-        self.x2 = int(max(0, x2))
-        self.y2 = int(max(0, y2))
-        self.confidence = confidence
-        self.class_id = class_id
-        self.track_id = track_id
-    
-    @property
-    def width(self):
-        return self.x2 - self.x1
-    
-    @property
-    def height(self):
-        return self.y2 - self.y1
-    
-    @property
-    def center(self):
-        return (self.x1 + self.width // 2, self.y1 + self.height // 2)
-    
-    def to_boxmot_format(self):
-        return [self.x1, self.y1, self.x2, self.y2, self.confidence, self.class_id]
-    
-    @classmethod
-    def from_boxmot_format(cls, track, class_id=0):
-        return cls(
-            x1=track[0], y1=track[1], x2=track[2], y2=track[3],
-            confidence=track[5] if len(track) > 5 else 1.0,
-            class_id=class_id,
-            track_id=int(track[4]) if len(track) > 4 else None
-        )
-
-
-class Frame:
-    def __init__(self, data):
-        self.data = np.ascontiguousarray(data)
-        self.height, self.width = data.shape[:2]
-    
-    def resize(self, width, height):
-        ratio = min(width / self.width, height / self.height)
-        new_w, new_h = int(self.width * ratio), int(self.height * ratio)
-        resized = cv2.resize(self.data, (new_w, new_h))
-        
-        delta_w, delta_h = width - new_w, height - new_h
-        top, bottom = delta_h // 2, delta_h - (delta_h // 2)
-        left, right = delta_w // 2, delta_w - (delta_w // 2)
-        
-        padded = cv2.copyMakeBorder(resized, top, bottom, left, right, 
-                                     cv2.BORDER_CONSTANT, value=[0, 0, 0])
-        
-        result = Frame(padded)
-        result.padding = (top, bottom, left, right)
-        result.scale_ratio = ratio
-        return result
-    
-    def to_model_input(self):
-        normalized = self.data.astype(np.float16) / 255.0
-        transposed = np.transpose(normalized, (2, 0, 1))
-        return np.expand_dims(transposed, axis=0)
-
-
-class HeadTrackerWithNameDisplay:
-    """Complete head tracker with name display"""
-    
-    def __init__(self, detection_model_path, 
-                 confidence_threshold=0.5, nms_threshold=0.45,
-                 frame_buffer_size=25, 
-                 edgeface_model='edgeface_xxs',
-                 use_torchhub=True,
-                 profiles_dir="data/visual_embeddings",
-                 identification_threshold=0.6):
-        
-        logging.info("Initializing Head Tracker with Name Display")
-        self.confidence_threshold = confidence_threshold
-        self.nms_threshold = nms_threshold
-        self.frame_buffer_size = frame_buffer_size
-        self.identification_threshold = identification_threshold
-        
-        # Load YOLO detection model
-        logging.info(f"Loading detection model: {detection_model_path}")
-        self.detector = YOLODetector(
-            detection_model_path,
-            confidence_threshold=confidence_threshold,
-            nms_threshold=nms_threshold,
-            use_gpu=False
-        )
-        
-        # Initialize EdgeFace
-        try:
-            self.edgeface = EdgeFaceEmbedder(
-                variant_or_path=edgeface_model, 
-                device='mps',
-                use_torchhub=use_torchhub
-            )
-            logging.info("Using MPS (Apple GPU) for EdgeFace")
-        except Exception as e:
-            logging.warning(f"MPS failed ({e}), falling back to CPU")
-            self.edgeface = EdgeFaceEmbedder(
-                variant_or_path=edgeface_model, 
-                device='cpu',
-                use_torchhub=use_torchhub
-            )
-        
-        # Load visual profile database
-        logging.info("Loading visual profile database...")
-        self.database = VisualProfileDatabase(profiles_dir)
-        
-        # Initialize ByteTrack
-        logging.info("Initializing ByteTrack for motion tracking")
-        self.motion_tracker = ByteTrack(
-            track_thresh=confidence_threshold,
-            track_buffer=30,
-            match_thresh=0.8,
-            frame_rate=30
-        )
-        
-        # Person management
-        self.tracked_persons = {}
-        self.next_person_id = 1
-        self.available_ids = set()
-        self.appearance_threshold = 0.5
-        
-        self.display_queue = queue.Queue(maxsize=5)
-        self.running = True
-        
-        logging.info("Tracker initialized successfully")
-        logging.info(f"Known persons in database: {len(self.database.known_persons)}")
-    
-    def _get_next_person_id(self):
-        if self.available_ids:
-            person_id = min(self.available_ids)
-            self.available_ids.remove(person_id)
-            return person_id
-        else:
-            person_id = self.next_person_id
-            self.next_person_id += 1
-            return person_id
-    
-    def _free_person_id(self, person_id):
-        self.available_ids.add(person_id)
-    
-    def detect_heads(self, frame):
-        """Detect heads using unified YOLO detector"""
-        head_bboxes = self.detector.detect_heads(frame)
-        
-        # Convert to ROI format
-        rois = []
-        for bbox in head_bboxes:
-            x1, y1, x2, y2, conf = bbox
-            rois.append(ROI(x1, y1, x2, y2, conf, class_id=0))
-        
-        return rois
-    
-    def extract_face_crops(self, frame, rois):
-        crops = []
-        valid_rois = []
-        
-        for roi in rois:
-            x1, y1, x2, y2 = int(roi.x1), int(roi.y1), int(roi.x2), int(roi.y2)
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-            
-            if x2 > x1 and y2 > y1 and (x2 - x1) > 10 and (y2 - y1) > 10:
-                crop = frame[y1:y2, x1:x2].copy()
-                crops.append(crop)
-                valid_rois.append(roi)
-        
-        return crops, valid_rois
-    
-    def compute_similarity(self, emb1, emb2):
-        if emb1 is None or emb2 is None:
-            return 0.0
-        return np.dot(emb1, emb2)
-    
-    def match_with_appearance(self, motion_tracks, embeddings, face_crops, frame):
-        for person in self.tracked_persons.values():
-            person.matched_this_frame = False
-        
-        matched_persons = []
-        
-        for track, embedding, face_crop in zip(motion_tracks, embeddings, face_crops):
-            motion_id = track.track_id
-            bbox = (track.x1, track.y1, track.x2, track.y2)
-            
-            # Try to match with existing persons
-            best_match_id = None
-            best_similarity = self.appearance_threshold
-            
-            for person_id, person in self.tracked_persons.items():
-                if person.matched_this_frame:
-                    continue
-                
-                person_emb = person.get_average_embedding()
-                if person_emb is not None and embedding is not None:
-                    similarity = self.compute_similarity(embedding, person_emb)
-                    
-                    if similarity > best_similarity:
-                        best_similarity = similarity
-                        best_match_id = person_id
-            
-            if best_match_id is not None:
-                # Update existing person
-                self.tracked_persons[best_match_id].update(bbox, embedding, face_crop)
-                matched_persons.append(self.tracked_persons[best_match_id])
-            else:
-                # New person
-                person_id = self._get_next_person_id()
-                person = TrackedPerson(
-                    person_id, bbox, embedding, 
-                    frame_buffer_size=self.frame_buffer_size
-                )
-                person.update(bbox, embedding, face_crop)
-                self.tracked_persons[person_id] = person
-                matched_persons.append(person)
-                logging.info(f"New person: ID {person_id}")
-        
-        # Identify persons against database
-        for person in matched_persons:
-            if person.embedding is not None:
-                identified_name, confidence = self.database.identify_person(
-                    person.embedding, 
-                    self.identification_threshold
-                )
-                person.set_identity(identified_name, confidence)
-                
-                if identified_name and person.frames_alive == 1:
-                    logging.info(f"Identified Person {person.track_id} as {identified_name} (confidence: {confidence:.2f})")
-        
-        # Remove persons not seen for too long
-        current_time = time.time()
-        to_remove = []
-        for person_id, person in self.tracked_persons.items():
-            if current_time - person.last_seen > 3.0:
-                to_remove.append(person_id)
-        
-        for person_id in to_remove:
-            logging.info(f"Removed person {person_id} (tracked {self.tracked_persons[person_id].total_frames_tracked} frames)")
-            del self.tracked_persons[person_id]
-            self._free_person_id(person_id)
-        
-        return matched_persons
-    
-    def process_frame(self, frame):
-        # 1. Detect heads
-        head_rois = self.detect_heads(frame)
-        
-        # 2. Motion tracking
-        dets = np.array([roi.to_boxmot_format() for roi in head_rois]) if head_rois else np.empty((0, 6))
-        
-        motion_tracks = []
-        if len(dets) > 0:
-            tracks = self.motion_tracker.update(dets, frame)
-            if tracks is not None and len(tracks) > 0:
-                motion_tracks = [ROI.from_boxmot_format(t, class_id=0) for t in tracks]
-        else:
-            self.motion_tracker.update(dets, frame)
-        
-        # 3. Extract face crops
-        face_crops, valid_tracks = self.extract_face_crops(frame, motion_tracks)
-        
-        # 4. Extract embeddings
-        embeddings_list = []
-        if len(face_crops) > 0:
-            try:
-                embeddings_list = self.edgeface.extract_embeddings(face_crops)
-            except Exception as e:
-                logging.error(f"Embedding extraction failed: {e}")
-                embeddings_list = [None] * len(face_crops)
-        
-        # 5. Match with appearance + identify
-        persons = self.match_with_appearance(valid_tracks, embeddings_list, face_crops, frame)
-        
-        # 6. Draw annotations
-        annotated_frame = frame.copy()
-        
-        for person in persons:
-            x1, y1, x2, y2 = [int(v) for v in person.bbox]
-            
-            # Color: Green if identified, Blue if unknown
-            color = (0, 255, 0) if person.identified_name else (255, 0, 0)
-            
-            # Draw bounding box
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw name/ID
-            label = person.get_display_name()
-            cv2.putText(annotated_frame, label, (x1, y1 - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            # Draw center point
-            center = (x1 + (x2 - x1) // 2, y1 + (y2 - y1) // 2)
-            cv2.circle(annotated_frame, center, 3, (0, 0, 255), -1)
-        
-        # Info overlay
-        cv2.putText(annotated_frame, f"Tracked: {len(persons)} | Known DB: {len(self.database.known_persons)}", 
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        
-        return annotated_frame, persons
-    
-    def start_processing(self, video_device=0, video_resolution=(1280, 720), framerate=30):
-        self.capture_thread = threading.Thread(
-            target=self._capture_loop,
-            args=(video_device, video_resolution, framerate)
-        )
-        self.capture_thread.daemon = True
-        self.capture_thread.start()
-        
-        try:
-            cv2.namedWindow("Head Tracking with Names", cv2.WINDOW_NORMAL)
-            while self.running:
+                    # timestamp format: Name_YYYYMMDD_HHMMSS
+                    parts = base.split('_')
+                    if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
+                        name = '_'.join(parts[:-2])
+                    else:
+                        name = parts[0]
+                emb = np.load(os.path.join(emb_dir, file))
+                self.known_embeddings[name] = emb
+                self._emb_files[name] = file
+        # Merge embeddings that are too similar (same person enrolled multiple times)
+        self._consolidate_embeddings()
+        # Sync person counter so new auto names don't collide
+        for name in self.known_embeddings:
+            if name.startswith("Person_"):
                 try:
-                    frame = self.display_queue.get(timeout=1.0)
-                    cv2.imshow("Head Tracking with Names", frame)
-                    
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        self.running = False
-                            
-                except queue.Empty:
-                    continue
-        finally:
-            self.running = False
-            if self.capture_thread.is_alive():
-                self.capture_thread.join(timeout=1.0)
-            cv2.destroyAllWindows()
-    
-    def _capture_loop(self, video_device, video_resolution, framerate):
-        try:
-            cap = cv2.VideoCapture(video_device, cv2.CAP_AVFOUNDATION)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, video_resolution[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, video_resolution[1])
-            cap.set(cv2.CAP_PROP_FPS, framerate)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer lag for real-time
-            
-            if not cap.isOpened():
-                raise ValueError(f"Cannot open camera {video_device}")
-            
-            fps_counter, fps_timer, fps = 0, time.time(), 0
-            
-            while self.running:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                start = time.time()
-                annotated, persons = self.process_frame(frame)
-                processing_time = time.time() - start
-                
-                fps_counter += 1
-                if time.time() - fps_timer > 1.0:
-                    fps = fps_counter / (time.time() - fps_timer)
-                    fps_counter, fps_timer = 0, time.time()
-                
-                cv2.putText(annotated, f"FPS: {fps:.1f} | {processing_time*1000:.0f}ms",
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                try:
-                    self.display_queue.put(annotated, block=False)
-                except queue.Full:
+                    n = int(name.rsplit("_", 1)[1])
+                    self._person_counter = max(self._person_counter, n)
+                except (ValueError, IndexError):
                     pass
-        
-        except Exception as e:
-            logging.error(f"Capture error: {e}", exc_info=True)
-        finally:
-            if 'cap' in locals():
-                cap.release()
 
+    def _consolidate_embeddings(self):
+        """Merge known embeddings that are too similar (same person enrolled multiple times)."""
+        names = list(self.known_embeddings.keys())
+        merged_into = {}  # name -> canonical name it was merged into
 
-def signal_handler(sig, frame):
-    detector.running = False
+        for i, name_a in enumerate(names):
+            if name_a in merged_into:
+                continue
+            for name_b in names[i + 1:]:
+                if name_b in merged_into:
+                    continue
+                emb_a = self.known_embeddings[name_a]
+                emb_b = self.known_embeddings[name_b]
+                sim = float(np.dot(emb_a, emb_b))
+                if sim >= self.MERGE_THRESHOLD:
+                    # Average and re-normalise
+                    avg = (emb_a + emb_b) / 2
+                    avg = avg / (np.linalg.norm(avg) + 1e-8)
+                    self.known_embeddings[name_a] = avg
+                    merged_into[name_b] = name_a
+                    print(f"[PersonIDTracker] Consolidated '{name_b}' -> '{name_a}' (sim={sim:.3f})")
+                    # Remove duplicate file and update canonical file on disk
+                    if self.emb_dir:
+                        dup_file = self._emb_files.get(name_b)
+                        if dup_file:
+                            dup_path = os.path.join(self.emb_dir, dup_file)
+                            if os.path.exists(dup_path):
+                                os.remove(dup_path)
+                        canon_file = self._emb_files.get(name_a)
+                        if canon_file:
+                            np.save(os.path.join(self.emb_dir, canon_file), avg)
 
+        for name in merged_into:
+            self.known_embeddings.pop(name, None)
+            self._emb_files.pop(name, None)
 
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal_handler)
-    
-    detector = HeadTrackerWithNameDisplay(
-        detection_model_path="./od_model/yolov11.onnx",  # Also supports yolov11.onnx
-        confidence_threshold=0.5,
-        nms_threshold=0.6,
-        frame_buffer_size=25,
-        edgeface_model='edgeface_xxs',
-        use_torchhub=True,
-        profiles_dir="data/visual_embeddings",
-        identification_threshold=0.2
-    )
-    
-    detector.start_processing(video_device=0, video_resolution=(1280, 720), framerate=30)
+    def _extract_face_embedding(self, face_img):
+        face_img = cv2.resize(face_img, (112, 112))
+        face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+        face_img = face_img.transpose((2, 0, 1))
+        tensor = torch.from_numpy(face_img).float().div(255.0)
+        tensor = (tensor - 0.5) / 0.5
+        tensor = tensor.unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            embedding = self.model(tensor).cpu().numpy().flatten()
+        embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
+        return embedding
+
+    def _best_match(self, emb, track_id=None):
+        scores = []
+        for name, known_emb in self.known_embeddings.items():
+            score = float(np.dot(emb, known_emb))
+            scores.append((name, score))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        best_name, best_score = scores[0] if scores else ("Unknown", -1.0)
+        # Log top matches para cada face (a cada 30 frames para não poluir)
+        if hasattr(self, '_match_log_counter'):
+            self._match_log_counter += 1
+        else:
+            self._match_log_counter = 0
+        if self._match_log_counter % 30 == 0 and scores:
+            top_str = " | ".join(f"{n}: {s:.2f}" for n, s in scores[:3])
+            tid_str = f"track={track_id}" if track_id is not None else ""
+            logger.debug(f"👤 FaceMatch {tid_str}: [{top_str}] thr={self.MATCH_THRESHOLD}")
+        if best_score < self.MATCH_THRESHOLD:
+            return "Unknown", best_score
+        return best_name, best_score
+
+    def _enroll(self, track_id, embeddings):
+        """Average buffered embeddings, save to disk, register in memory."""
+        avg_emb = np.mean(embeddings, axis=0)
+        avg_emb = avg_emb / (np.linalg.norm(avg_emb) + 1e-8)
+
+        # Check if close enough to a known person to merge (bypass MATCH_THRESHOLD, use MERGE_THRESHOLD directly)
+        # so different-angle views of the same face don't create duplicates
+        merge_name, merge_score = None, -1.0
+        for name, known_emb in self.known_embeddings.items():
+            score = float(np.dot(avg_emb, known_emb))
+            if score > merge_score:
+                merge_score = score
+                merge_name = name
+        if merge_name is not None and merge_score >= self.MERGE_THRESHOLD:
+            logger.debug(f"👤 Enroll track={int(track_id)}: MERGED into '{merge_name}' (sim={merge_score:.3f} >= {self.MERGE_THRESHOLD})")
+            self._track_to_name[track_id] = merge_name
+            return merge_name
+
+        self._person_counter += 1
+        name = f"Person_{self._person_counter}"
+        logger.debug(f"👤 Enroll track={int(track_id)}: NEW '{name}' (best_merge='{merge_name}' sim={merge_score:.3f} < {self.MERGE_THRESHOLD})")
+        self.known_embeddings[name] = avg_emb
+        self._track_to_name[track_id] = name
+
+        if self.emb_dir:
+            os.makedirs(self.emb_dir, exist_ok=True)
+            filename = f"{name}_auto.npy"
+            np.save(os.path.join(self.emb_dir, filename), avg_emb)
+            if hasattr(self, '_emb_files'):
+                self._emb_files[name] = filename
+            print(f"[PersonIDTracker] Auto-enrolled: {name} (track {int(track_id)})")
+
+        return name
+
+    def rename_person(self, old_name, new_name, only_track_id=None):
+        """Renomeia uma identidade em memória e em disco quando o nome real é detectado.
+
+        Args:
+            only_track_id: se fornecido, só renomeia esse track específico
+                           (evita renomear rostos de família que foram mergidos).
+        """
+        if old_name not in self.known_embeddings:
+            return
+        if only_track_id is not None:
+            # Renomeia apenas o track solicitado; mantém o embedding do old_name
+            # para os demais tracks que ainda o usam.
+            other_tracks_use = any(
+                tid != only_track_id and tname == old_name
+                for tid, tname in self._track_to_name.items()
+            )
+            if other_tracks_use:
+                # Copia o embedding para o novo nome (não remove o antigo)
+                self.known_embeddings[new_name] = self.known_embeddings[old_name].copy()
+                self._track_to_name[only_track_id] = new_name
+            else:
+                # Único track — pode renomear normalmente
+                emb = self.known_embeddings.pop(old_name)
+                self.known_embeddings[new_name] = emb
+                self._track_to_name[only_track_id] = new_name
+        else:
+            emb = self.known_embeddings.pop(old_name)
+            self.known_embeddings[new_name] = emb
+            # Atualiza track → name
+            for track_id, tname in self._track_to_name.items():
+                if tname == old_name:
+                    self._track_to_name[track_id] = new_name
+        # Renomeia arquivo em disco
+        if self.emb_dir:
+            old_file = self._emb_files.pop(old_name, None)
+            if old_file:
+                old_path = os.path.join(self.emb_dir, old_file)
+                new_file = f"{new_name}_auto.npy"
+                new_path = os.path.join(self.emb_dir, new_file)
+                if os.path.exists(old_path):
+                    if os.path.exists(new_path):
+                        os.remove(new_path)
+                    os.rename(old_path, new_path)
+                self._emb_files[new_name] = new_file
+        print(f"[PersonIDTracker] Renomeado '{old_name}' -> '{new_name}'")
+        # Re-consolidar após rename para mesclar duplicatas criadas na sessão
+        self._consolidate_embeddings()
+        # Corrigir _track_to_name de tracks que apontavam para entidades mescladas
+        for tid in list(self._track_to_name.keys()):
+            if self._track_to_name[tid] not in self.known_embeddings:
+                self._track_to_name.pop(tid, None)
+
+    def update(self, frame, bboxes):
+        if len(bboxes) == 0:
+            return []
+
+        tracks = self.tracker.update(np.array(bboxes), frame)
+        results = []
+
+        # Rastreia quais nomes já foram atribuídos neste frame para evitar duplicatas
+        # (uma pessoa não pode aparecer em dois lugares ao mesmo tempo)
+        claimed_this_frame = {}  # name -> track_id
+
+        # Pré-reserva nomes reais já atribuídos a tracks ativos, para que
+        # outro track não "roube" o nome via _best_match numa ordem aleatória
+        _generic_re = __import__('re').compile(r'^(Person_\d+|Unknown)$')
+        active_track_ids = {int(t[4]) for t in tracks}
+        for tid, tname in self._track_to_name.items():
+            if tid in active_track_ids and not _generic_re.match(tname):
+                claimed_this_frame[tname] = tid
+
+        for track in tracks:
+            x1, y1, x2, y2, track_id, conf, cls, *_ = track
+            face_img = frame[int(y1):int(y2), int(x1):int(x2)]
+
+            if face_img.size == 0:
+                continue
+
+            current_emb = self._extract_face_embedding(face_img)
+            best_name, best_score = self._best_match(current_emb, track_id=int(track_id))
+
+            if best_name != "Unknown":
+                # Verifica se o nome já foi reivindicado por outro track neste frame
+                if best_name in claimed_this_frame and claimed_this_frame[best_name] != track_id:
+                    # Mesmo nome em dois rostos — trata este como desconhecido
+                    best_name, best_score = "Unknown", 0.0
+                else:
+                    already_confirmed = self._track_to_name.get(track_id) == best_name
+                    if already_confirmed:
+                        # Nome já confirmado — mantém normalmente
+                        claimed_this_frame[best_name] = track_id
+                        self._track_buffer.pop(track_id, None)
+                        self._persist_fail_count.pop(track_id, None)
+                        self._name_confirm.pop(track_id, None)
+                    else:
+                        # Bloqueia re-confirmação se o nome atual ainda é plausível,
+                        # a não ser que o novo match seja muito mais forte (identidade diferente).
+                        current_confirmed = self._track_to_name.get(track_id)
+                        if current_confirmed is not None and current_confirmed in self.known_embeddings:
+                            persist_sim = float(np.dot(current_emb, self.known_embeddings[current_confirmed]))
+                            # Permite transição quando: novo score é alto (≥0.65) E identidade atual está fraca (<0.35)
+                            strong_new = best_score >= 0.65 and persist_sim < 0.35
+                            if persist_sim >= 0.20 and not strong_new:
+                                # Nome atual ainda segura — ignora o novo match
+                                logger.debug(f"👤 Re-confirm BLOCKED track={int(track_id)}: keep '{current_confirmed}' (sim={persist_sim:.2f}) over '{best_name}'")
+                                best_name, best_score = "Unknown", 0.0
+                            elif strong_new:
+                                logger.debug(f"👤 Re-confirm OVERRIDE track={int(track_id)}: '{current_confirmed}' (sim={persist_sim:.2f}) → '{best_name}' (score={best_score:.2f})")
+                                # Remove a identidade fraca antes de re-confirmar
+                                self._track_to_name.pop(track_id, None)
+
+                        # Ainda não confirmado — acumula votos antes de promover
+                        if best_name != "Unknown":
+                            buf = self._name_confirm.get(track_id)
+                            if buf and buf["name"] == best_name:
+                                buf["count"] += 1
+                            else:
+                                self._name_confirm[track_id] = {"name": best_name, "count": 1}
+                                buf = self._name_confirm[track_id]
+
+                            if buf["count"] >= self.CONFIRM_FRAMES:
+                                # Confirmado: promove ao _track_to_name
+                                claimed_this_frame[best_name] = track_id
+                                self._track_to_name[track_id] = best_name
+                                self._track_buffer.pop(track_id, None)
+                                self._persist_fail_count.pop(track_id, None)
+                                self._name_confirm.pop(track_id, None)
+                                logger.debug(f"👤 Confirmed track={int(track_id)}: '{best_name}' ({self.CONFIRM_FRAMES} frames)")
+                            else:
+                                # Ainda aguardando confirmação — retorna Unknown por ora
+                                logger.debug(f"👤 Pending track={int(track_id)}: '{best_name}' ({buf['count']}/{self.CONFIRM_FRAMES})")
+                                best_name, best_score = "Unknown", 0.0
+
+            if best_name == "Unknown" and track_id in self._track_to_name:
+                prev_name = self._track_to_name[track_id]
+                # Valida: o embedding atual ainda é compatível com o nome persistido?
+                # Se o nome persistido existe em known_embeddings, checa similaridade mínima.
+                # Evita que um nome incorretamente atribuído persista para sempre.
+                persist_ok = True
+                if prev_name in self.known_embeddings:
+                    persist_sim = float(np.dot(current_emb, self.known_embeddings[prev_name]))
+                    if persist_sim < 0.20:
+                        fail_count = self._persist_fail_count.get(track_id, 0) + 1
+                        self._persist_fail_count[track_id] = fail_count
+                        if fail_count >= 3:
+                            # 3 consecutive bad frames — drop the identity
+                            logger.debug(f"👤 Persist DROPPED track={int(track_id)}: '{prev_name}' sim={persist_sim:.2f} ({fail_count} consecutive fails)")
+                            persist_ok = False
+                            del self._track_to_name[track_id]
+                            del self._persist_fail_count[track_id]
+                            self._name_confirm.pop(track_id, None)  # reseta confirmação pendente
+                        else:
+                            logger.debug(f"👤 Persist WARNING track={int(track_id)}: '{prev_name}' sim={persist_sim:.2f} ({fail_count}/3)")
+                    else:
+                        # Good frame — reset fail counter
+                        self._persist_fail_count.pop(track_id, None)
+                # Só mantém o nome anterior se não estiver em uso por outro track
+                if persist_ok and (prev_name not in claimed_this_frame or claimed_this_frame[prev_name] == track_id):
+                    best_name = prev_name
+                    best_score = 1.0
+                    claimed_this_frame[best_name] = track_id
+
+            if best_name == "Unknown":
+                # Buffer para auto-enrolamento
+                buf = self._track_buffer.setdefault(track_id, [])
+                buf.append(current_emb)
+                if len(buf) >= self.ENROLL_FRAMES:
+                    best_name = self._enroll(track_id, buf)
+                    best_score = 1.0
+                    del self._track_buffer[track_id]
+                    claimed_this_frame[best_name] = track_id
+
+            results.append({
+                "track_id": track_id,
+                "name": best_name,
+                "confidence": best_score,
+                "bbox": [x1, y1, x2, y2]
+            })
+
+        return results

@@ -134,3 +134,5 @@ data/
 *.sh
 vox_100_atores/
 vox_300_atores/
+
+realtime_sessions/
