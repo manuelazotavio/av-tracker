@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import cv2
 import torch
@@ -23,10 +24,10 @@ class _EdgeFaceXXS(nn.Module):
 
 
 class PersonIDTracker:
-    MATCH_THRESHOLD = 0.45  # cosine similarity to consider a known person
-    MERGE_THRESHOLD = 0.35  # threshold for merging during auto-enrollment
+    MATCH_THRESHOLD = 0.65  # cosine similarity to consider a known person
+    MERGE_THRESHOLD = 0.50  # threshold for merging during auto-enrollment
     ENROLL_FRAMES = 50      # frames to accumulate (~5s) for more stable average embedding
-    CONFIRM_FRAMES = 4      # consecutive frames needed to confirm a known-name assignment
+    CONFIRM_FRAMES = 6      # consecutive frames needed to confirm a known-name assignment
 
     def __init__(self, model_path="od_model/edgeface_xxs.pt", device="cuda"):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
@@ -44,12 +45,18 @@ class PersonIDTracker:
         self._person_counter = 0
         self._persist_fail_count = {}  # track_id -> consecutive persist failures
         self._name_confirm = {}      # track_id -> {"name": str, "count": int}
+        self._override_last_frame = {}  # track_id -> frame index of last OVERRIDE
+        self._track_last_seen = {}   # track_id -> time.time() of last visible frame
+        self._perf = {}  # key -> list[float ms]
+        self._perf_frame_count = 0
+        self._perf_summary_interval = 100  # prints summary every N frames
 
     def load_known_embeddings(self, emb_dir):
         self.emb_dir = emb_dir
         if not os.path.exists(emb_dir):
             return
         self._emb_files = {}  # name -> filename on disk (for consolidation cleanup)
+        _raw_face_embs = {}  # name -> list of np.array (for averaging multiple entries)
         for file in os.listdir(emb_dir):
             if file.endswith(".npy"):
                 base = file[:-4]  # remove .npy
@@ -63,8 +70,13 @@ class PersonIDTracker:
                     else:
                         name = parts[0]
                 emb = np.load(os.path.join(emb_dir, file))
-                self.known_embeddings[name] = emb
+                _raw_face_embs.setdefault(name, []).append(emb)
                 self._emb_files[name] = file
+        # Average of multiple embeddings per person (different lighting/angle conditions)
+        for name, embs in _raw_face_embs.items():
+            avg = np.mean(embs, axis=0)
+            norm = np.linalg.norm(avg)
+            self.known_embeddings[name] = avg / norm if norm > 0 else avg
         # Merge embeddings that are too similar (same person enrolled multiple times)
         self._consolidate_embeddings()
         # Sync person counter so new auto names don't collide
@@ -131,7 +143,7 @@ class PersonIDTracker:
             scores.append((name, score))
         scores.sort(key=lambda x: x[1], reverse=True)
         best_name, best_score = scores[0] if scores else ("Unknown", -1.0)
-        # Log top matches para cada face (a cada 30 frames para não poluir)
+        # Log top matches for each face (every 30 frames to avoid clutter)
         if hasattr(self, '_match_log_counter'):
             self._match_log_counter += 1
         else:
@@ -157,10 +169,18 @@ class PersonIDTracker:
             if score > merge_score:
                 merge_score = score
                 merge_name = name
-        if merge_name is not None and merge_score >= self.MERGE_THRESHOLD:
+        # Don't merge if the target name is already confirmed for another active track.
+        # Two distinct people cannot share the same identity.
+        _merge_blocked = merge_name is not None and any(
+            tid != track_id and tname == merge_name
+            for tid, tname in self._track_to_name.items()
+        )
+        if merge_name is not None and merge_score >= self.MERGE_THRESHOLD and not _merge_blocked:
             logger.debug(f"👤 Enroll track={int(track_id)}: MERGED into '{merge_name}' (sim={merge_score:.3f} >= {self.MERGE_THRESHOLD})")
             self._track_to_name[track_id] = merge_name
             return merge_name
+        if _merge_blocked:
+            logger.debug(f"👤 Enroll track={int(track_id)}: merge BLOCKED ('{merge_name}' already belongs to another track) → new Person_N")
 
         self._person_counter += 1
         name = f"Person_{self._person_counter}"
@@ -179,38 +199,38 @@ class PersonIDTracker:
         return name
 
     def rename_person(self, old_name, new_name, only_track_id=None):
-        """Renomeia uma identidade em memória e em disco quando o nome real é detectado.
+        """Renames an identity in memory and on disk when the real name is detected.
 
         Args:
-            only_track_id: se fornecido, só renomeia esse track específico
-                           (evita renomear rostos de família que foram mergidos).
+            only_track_id: if provided, only renames this specific track
+                           (avoids renaming family faces that were merged).
         """
         if old_name not in self.known_embeddings:
             return
         if only_track_id is not None:
-            # Renomeia apenas o track solicitado; mantém o embedding do old_name
-            # para os demais tracks que ainda o usam.
+            # Only renames the requested track; keeps the old_name embedding
+            # for the other tracks that still use it.
             other_tracks_use = any(
                 tid != only_track_id and tname == old_name
                 for tid, tname in self._track_to_name.items()
             )
             if other_tracks_use:
-                # Copia o embedding para o novo nome (não remove o antigo)
+                # Copies the embedding to the new name (does not remove the old one)
                 self.known_embeddings[new_name] = self.known_embeddings[old_name].copy()
                 self._track_to_name[only_track_id] = new_name
             else:
-                # Único track — pode renomear normalmente
+                # Only track — can rename normally
                 emb = self.known_embeddings.pop(old_name)
                 self.known_embeddings[new_name] = emb
                 self._track_to_name[only_track_id] = new_name
         else:
             emb = self.known_embeddings.pop(old_name)
             self.known_embeddings[new_name] = emb
-            # Atualiza track → name
+            # Updates track → name
             for track_id, tname in self._track_to_name.items():
                 if tname == old_name:
                     self._track_to_name[track_id] = new_name
-        # Renomeia arquivo em disco
+        # Renames file on disk
         if self.emb_dir:
             old_file = self._emb_files.pop(old_name, None)
             if old_file:
@@ -222,31 +242,54 @@ class PersonIDTracker:
                         os.remove(new_path)
                     os.rename(old_path, new_path)
                 self._emb_files[new_name] = new_file
-        print(f"[PersonIDTracker] Renomeado '{old_name}' -> '{new_name}'")
-        # Re-consolidar após rename para mesclar duplicatas criadas na sessão
+        print(f"[PersonIDTracker] Renamed '{old_name}' -> '{new_name}'")
+        # Re-consolidate after rename to merge duplicates created in the session
         self._consolidate_embeddings()
-        # Corrigir _track_to_name de tracks que apontavam para entidades mescladas
+        # Fix _track_to_name for tracks that pointed to merged entities
         for tid in list(self._track_to_name.keys()):
             if self._track_to_name[tid] not in self.known_embeddings:
                 self._track_to_name.pop(tid, None)
+
+    def _log_perf(self, key: str, ms: float):
+        self._perf.setdefault(key, []).append(ms)
+        logger.debug(f"⏱ {key}: {ms:.0f}ms")
+
+    def _print_perf_summary(self):
+        lines = ["⏱ === Video Perf Summary ==="]
+        for key in sorted(self._perf):
+            vals = self._perf[key]
+            if vals:
+                lines.append(f"  {key:30s} avg={sum(vals)/len(vals):6.0f}ms  min={min(vals):5.0f}ms  max={max(vals):5.0f}ms  n={len(vals)}")
+        print("\n".join(lines))
 
     def update(self, frame, bboxes):
         if len(bboxes) == 0:
             return []
 
+        _t0_frame = time.perf_counter()
+        _t0_bytetrack = time.perf_counter()
         tracks = self.tracker.update(np.array(bboxes), frame)
+        self._log_perf("bytetrack", (time.perf_counter() - _t0_bytetrack) * 1000)
         results = []
 
-        # Rastreia quais nomes já foram atribuídos neste frame para evitar duplicatas
-        # (uma pessoa não pode aparecer em dois lugares ao mesmo tempo)
+        # Tracks which names have already been assigned in this frame to avoid duplicates
+        # (a person cannot appear in two places at the same time)
         claimed_this_frame = {}  # name -> track_id
 
-        # Pré-reserva nomes reais já atribuídos a tracks ativos, para que
-        # outro track não "roube" o nome via _best_match numa ordem aleatória
+        # Pre-reserves real names already assigned to recently seen tracks, so that
+        # another track doesn't "steal" the name when the person leaves the frame momentarily.
+        # Names loaded from disk (persistent embeddings) get a long protection window (30s);
+        # names auto-enrolled in the session but without a file yet get a short protection (5s).
         _generic_re = __import__('re').compile(r'^(Person_\d+|Unknown)$')
         active_track_ids = {int(t[4]) for t in tracks}
+        _now = time.time()
         for tid, tname in self._track_to_name.items():
-            if tid in active_track_ids and not _generic_re.match(tname):
+            if _generic_re.match(tname):
+                continue
+            last_seen = self._track_last_seen.get(tid, 0.0)
+            # Names with persistent embeddings in the database get a longer window
+            protection_secs = 30.0 if tname in self.known_embeddings else 5.0
+            if tid in active_track_ids or (_now - last_seen) < protection_secs:
                 claimed_this_frame[tname] = tid
 
         for track in tracks:
@@ -256,40 +299,70 @@ class PersonIDTracker:
             if face_img.size == 0:
                 continue
 
+            _t0_emb = time.perf_counter()
             current_emb = self._extract_face_embedding(face_img)
+            self._log_perf("face_embedding", (time.perf_counter() - _t0_emb) * 1000)
+            self._track_last_seen[int(track_id)] = time.time()
             best_name, best_score = self._best_match(current_emb, track_id=int(track_id))
 
             if best_name != "Unknown":
-                # Verifica se o nome já foi reivindicado por outro track neste frame
+                # Check if the name has already been claimed by another track in this frame
                 if best_name in claimed_this_frame and claimed_this_frame[best_name] != track_id:
-                    # Mesmo nome em dois rostos — trata este como desconhecido
+                    # Same name on two faces — treat this one as unknown
                     best_name, best_score = "Unknown", 0.0
                 else:
                     already_confirmed = self._track_to_name.get(track_id) == best_name
                     if already_confirmed:
-                        # Nome já confirmado — mantém normalmente
+                        # Name already confirmed — keep as normal
                         claimed_this_frame[best_name] = track_id
                         self._track_buffer.pop(track_id, None)
                         self._persist_fail_count.pop(track_id, None)
                         self._name_confirm.pop(track_id, None)
                     else:
-                        # Bloqueia re-confirmação se o nome atual ainda é plausível,
-                        # a não ser que o novo match seja muito mais forte (identidade diferente).
+                        # Block re-confirmation if the current name is still plausible,
+                        # unless the new match is much stronger (different identity).
                         current_confirmed = self._track_to_name.get(track_id)
                         if current_confirmed is not None and current_confirmed in self.known_embeddings:
                             persist_sim = float(np.dot(current_emb, self.known_embeddings[current_confirmed]))
-                            # Permite transição quando: novo score é alto (≥0.65) E identidade atual está fraca (<0.35)
-                            strong_new = best_score >= 0.65 and persist_sim < 0.35
-                            if persist_sim >= 0.20 and not strong_new:
-                                # Nome atual ainda segura — ignora o novo match
+                            # Allow transition when: new score is high (>=0.75) AND current identity is weak (<0.35)
+                            # Cooldown: blocks new OVERRIDE for 90 frames after the last one
+                            override_cooldown_ok = (
+                                time.time() - self._override_last_frame.get(track_id, 0.0) > 3.0
+                            )
+                            strong_new = best_score >= 0.75 and persist_sim < 0.35 and override_cooldown_ok
+                            # Generic upgrade → real name: Person_N can be replaced by a real name
+                            # with normal threshold (0.45) when the generic identity is already weak (<0.45)
+                            import re as _re
+                            _is_generic = lambda n: bool(_re.match(r'^(Person_\d+|Unknown)$', n or ""))
+                            generic_upgrade = (
+                                _is_generic(current_confirmed) and not _is_generic(best_name)
+                                and best_score >= self.MATCH_THRESHOLD and persist_sim < 0.45
+                                and override_cooldown_ok
+                            )
+                            if persist_sim >= 0.20 and not strong_new and not generic_upgrade:
+                                # Current name still holds — ignore the new match
                                 logger.debug(f"👤 Re-confirm BLOCKED track={int(track_id)}: keep '{current_confirmed}' (sim={persist_sim:.2f}) over '{best_name}'")
                                 best_name, best_score = "Unknown", 0.0
-                            elif strong_new:
+                            elif strong_new or generic_upgrade:
+                                self._override_last_frame[track_id] = time.time()
                                 logger.debug(f"👤 Re-confirm OVERRIDE track={int(track_id)}: '{current_confirmed}' (sim={persist_sim:.2f}) → '{best_name}' (score={best_score:.2f})")
-                                # Remove a identidade fraca antes de re-confirmar
+                                # Remove the weak identity before re-confirming
                                 self._track_to_name.pop(track_id, None)
+                                # If we're transitioning from a generic name (Person_N) to a real name,
+                                # remove the generic embedding — it was absorbed by the real identity.
+                                _generic_emb_re = __import__('re').compile(r'^Person_\d+$')
+                                if _generic_emb_re.match(current_confirmed) and not _generic_emb_re.match(best_name):
+                                    self.known_embeddings.pop(current_confirmed, None)
+                                    # Remove file from disk as well
+                                    if self.emb_dir and os.path.exists(self.emb_dir):
+                                        for _f in list(os.listdir(self.emb_dir)):
+                                            _base = os.path.splitext(_f)[0]
+                                            if _base == current_confirmed or _base.startswith(current_confirmed + "_"):
+                                                try: os.remove(os.path.join(self.emb_dir, _f))
+                                                except OSError: pass
+                                    logger.debug(f"👤 Removed generic embedding '{current_confirmed}' (superseded by '{best_name}')")
 
-                        # Ainda não confirmado — acumula votos antes de promover
+                        # Not yet confirmed — accumulate votes before promoting
                         if best_name != "Unknown":
                             buf = self._name_confirm.get(track_id)
                             if buf and buf["name"] == best_name:
@@ -299,7 +372,7 @@ class PersonIDTracker:
                                 buf = self._name_confirm[track_id]
 
                             if buf["count"] >= self.CONFIRM_FRAMES:
-                                # Confirmado: promove ao _track_to_name
+                                # Confirmed: promote to _track_to_name
                                 claimed_this_frame[best_name] = track_id
                                 self._track_to_name[track_id] = best_name
                                 self._track_buffer.pop(track_id, None)
@@ -307,15 +380,15 @@ class PersonIDTracker:
                                 self._name_confirm.pop(track_id, None)
                                 logger.debug(f"👤 Confirmed track={int(track_id)}: '{best_name}' ({self.CONFIRM_FRAMES} frames)")
                             else:
-                                # Ainda aguardando confirmação — retorna Unknown por ora
+                                # Still awaiting confirmation — return Unknown for now
                                 logger.debug(f"👤 Pending track={int(track_id)}: '{best_name}' ({buf['count']}/{self.CONFIRM_FRAMES})")
                                 best_name, best_score = "Unknown", 0.0
 
             if best_name == "Unknown" and track_id in self._track_to_name:
                 prev_name = self._track_to_name[track_id]
-                # Valida: o embedding atual ainda é compatível com o nome persistido?
-                # Se o nome persistido existe em known_embeddings, checa similaridade mínima.
-                # Evita que um nome incorretamente atribuído persista para sempre.
+                # Validate: is the current embedding still compatible with the persisted name?
+                # If the persisted name exists in known_embeddings, check minimum similarity.
+                # Prevents an incorrectly assigned name from persisting forever.
                 persist_ok = True
                 if prev_name in self.known_embeddings:
                     persist_sim = float(np.dot(current_emb, self.known_embeddings[prev_name]))
@@ -328,20 +401,20 @@ class PersonIDTracker:
                             persist_ok = False
                             del self._track_to_name[track_id]
                             del self._persist_fail_count[track_id]
-                            self._name_confirm.pop(track_id, None)  # reseta confirmação pendente
+                            self._name_confirm.pop(track_id, None)  # reset pending confirmation
                         else:
                             logger.debug(f"👤 Persist WARNING track={int(track_id)}: '{prev_name}' sim={persist_sim:.2f} ({fail_count}/3)")
                     else:
                         # Good frame — reset fail counter
                         self._persist_fail_count.pop(track_id, None)
-                # Só mantém o nome anterior se não estiver em uso por outro track
+                # Only keep the previous name if it's not in use by another track
                 if persist_ok and (prev_name not in claimed_this_frame or claimed_this_frame[prev_name] == track_id):
                     best_name = prev_name
                     best_score = 1.0
                     claimed_this_frame[best_name] = track_id
 
             if best_name == "Unknown":
-                # Buffer para auto-enrolamento
+                # Buffer for auto-enrollment
                 buf = self._track_buffer.setdefault(track_id, [])
                 buf.append(current_emb)
                 if len(buf) >= self.ENROLL_FRAMES:
@@ -357,4 +430,8 @@ class PersonIDTracker:
                 "bbox": [x1, y1, x2, y2]
             })
 
+        self._log_perf("tracker_update_total", (time.perf_counter() - _t0_frame) * 1000)
+        self._perf_frame_count += 1
+        if self._perf_frame_count % self._perf_summary_interval == 0:
+            self._print_perf_summary()
         return results

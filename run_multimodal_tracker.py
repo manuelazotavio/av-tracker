@@ -22,9 +22,10 @@ except ImportError:
 class MultimodalFusion:
     def __init__(self, hf_token, device="cuda", num_speakers=None, audio_device=None, video_file=None):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
-        self.video_file = video_file  # None → webcam em tempo real
+        self.video_file = video_file  # None → real-time webcam
+        self.num_speakers = num_speakers  # limits tracked faces by area
 
-        # Person registry compartilhado entre áudio e vídeo
+        # Person registry shared between audio and video
         _counter = [0]
         def _make_person_id():
             _counter[0] += 1
@@ -44,8 +45,8 @@ class MultimodalFusion:
         os.makedirs(emb_dir, exist_ok=True)
         os.makedirs(face_emb_dir, exist_ok=True)
 
-        self.verifier = MultiSpeakerVerifier(emb_dir, threshold=0.70)
-        # Registra embeddings já conhecidos no registry antes de iniciar o transcriber
+        self.verifier = MultiSpeakerVerifier(emb_dir, threshold=0.80)
+        # Register already known embeddings in the registry before starting the transcriber
         for emb_name in self.verifier.embeddings.keys():
             pid = _make_person_id()
             self.shared_state["embedding_to_person"][emb_name] = pid
@@ -55,7 +56,9 @@ class MultimodalFusion:
             self.verifier,
             hf_token,
             device=self.device,
-            verifier_confidence_min=0.80,
+            whisper_size="large-v3-turbo",
+            use_ai_analysis=True,
+            verifier_confidence_min=0.70,
             shared_state=self.shared_state,
             num_speakers=num_speakers,
             audio_device=audio_device,
@@ -65,20 +68,20 @@ class MultimodalFusion:
         self.tracker = PersonIDTracker(model_path="od_model/edgeface_xxs.pt", device=self.device)
         self.tracker.load_known_embeddings(face_emb_dir)
 
-        # Expõe o tracker no shared_state para que o transcriber possa renomear embeddings de rosto
+        # Expose the tracker in shared_state so the transcriber can rename face embeddings
         self.shared_state["face_tracker"] = self.tracker
 
-        # Active Speaker Detection — detecta movimento labial por face
+        # Active Speaker Detection — detects lip movement per face
         self.asd = ActiveSpeakerDetector()
         self.shared_state["asd"] = self.asd
 
     def _feed_file_audio(self, video_file: str):
-        """Extrai áudio do arquivo de vídeo e alimenta o transcriber em tempo real simulado."""
+        """Extracts audio from the video file and feeds the transcriber in simulated real-time."""
         import subprocess, tempfile, importlib
         sr = self.transcriber.sample_rate
-        print("🔊 Carregando áudio do vídeo...")
+        print("🔊 Loading audio from video...")
 
-        # Tenta extrair via ffmpeg (mais robusto para MP4/MKV no Windows)
+        # Try extracting via ffmpeg (more robust for MP4/MKV on Windows)
         audio = None
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
@@ -94,84 +97,108 @@ class MultimodalFusion:
             else:
                 raise RuntimeError(result.stderr.decode(errors="ignore")[-300:])
         except FileNotFoundError:
-            pass  # ffmpeg não está no PATH — tenta librosa
+            pass  # ffmpeg not in PATH — try librosa
         except Exception as e:
-            print(f"⚠️  ffmpeg falhou ({e}), tentando librosa...")
+            print(f"⚠️  ffmpeg failed ({e}), trying librosa...")
         finally:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
 
-        # Fallback: librosa (funciona se audioread/soundfile suportar o formato)
+        # Fallback: librosa (works if audioread/soundfile supports the format)
         if audio is None:
             if not _LIBROSA_AVAILABLE:
-                print("❌ Nem ffmpeg nem librosa disponíveis. Instale ffmpeg ou: pip install librosa")
+                print("❌ Neither ffmpeg nor librosa available. Install ffmpeg or: pip install librosa")
                 return
             try:
                 audio, _ = librosa.load(video_file, sr=sr, mono=True)
             except Exception as e:
-                print(f"❌ Erro ao carregar áudio do vídeo: {e}")
-                print("   Instale ffmpeg e adicione ao PATH: https://ffmpeg.org/download.html")
+                print(f"❌ Error loading audio from video: {e}")
+                print("   Install ffmpeg and add it to PATH: https://ffmpeg.org/download.html")
                 return
 
-        chunk_size = int(self.transcriber.sample_rate * 0.1)  # 100 ms por chunk
+        chunk_size = int(self.transcriber.sample_rate * 0.1)  # 100 ms per chunk
         total = len(audio)
         pos = 0
-        print(f"🔊 Alimentando {total / self.transcriber.sample_rate:.1f}s de áudio para o transcriber...")
+        print(f"🔊 Feeding {total / self.transcriber.sample_rate:.1f}s of audio to the transcriber...")
         while pos < total and self.transcriber.running:
             chunk = audio[pos:pos + chunk_size]
             self.transcriber.feed_audio_chunk(chunk)
             pos += chunk_size
-            time.sleep(0.1)  # simula tempo real
+            time.sleep(0.1)  # simulate real-time
 
     def video_loop(self):
         cap = cv2.VideoCapture(self.video_file if self.video_file else 0)
 
         if not cap.isOpened():
-            src = f"arquivo '{self.video_file}'" if self.video_file else "webcam"
-            print(f"❌ Erro: Não foi possível abrir {src}.")
+            src = f"file '{self.video_file}'" if self.video_file else "webcam"
+            print(f"❌ Error: Could not open {src}.")
             return
 
         person_names = self.shared_state["person_names"]
         emb_to_person = self.shared_state["embedding_to_person"]
         make_pid = self.shared_state["person_id_factory"]
         _generic_re = re.compile(r'^(Person_\d+|spk_\d+|Desconhecido_\d+)$')
-        track_to_pid = {}  # track_id → person_id (persistente entre frames)
+        track_to_pid = {}  # track_id → person_id (persistent across frames)
+
+        _vperf = {}  # key -> list[ms]
+        _vframe_count = 0
+        _VPERF_INTERVAL = 100
+
+        def _vlog(key, ms):
+            _vperf.setdefault(key, []).append(ms)
+
+        def _vprint_summary():
+            lines = ["⏱ === Video Loop Perf Summary ==="]
+            for key in sorted(_vperf):
+                vals = _vperf[key]
+                lines.append(f"  {key:30s} avg={sum(vals)/len(vals):6.1f}ms  min={min(vals):5.1f}ms  max={max(vals):5.1f}ms  n={len(vals)}")
+            print("\n".join(lines))
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
+            _t0_frame = time.perf_counter()
+
+            _t0 = time.perf_counter()
             bboxes = self.detector.detect(frame)
+            _vlog("detect", (time.perf_counter() - _t0) * 1000)
+
+            if self.num_speakers and len(bboxes) > self.num_speakers:
+                bboxes = sorted(bboxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)[:self.num_speakers]
+
+            _t0 = time.perf_counter()
             results = self.tracker.update(frame, bboxes)
+            _vlog("tracker_update", (time.perf_counter() - _t0) * 1000)
 
             current_faces = {}
-            used_names_this_frame = {}  # name → track_id (evita dois rostos com mesmo nome real)
+            used_names_this_frame = {}  # name → track_id (prevents two faces with the same real name)
             for res in results:
                 face_name = res['name']   # "Manuela", "Person_1", etc.
                 track_id = res['track_id']
 
                 if track_id in track_to_pid:
                     person_id = track_to_pid[track_id]
-                    # Se o face tracker aprendeu um nome real para este track, sincroniza
+                    # If the face tracker learned a real name for this track, sync it
                     if face_name in emb_to_person:
                         person_id = emb_to_person[face_name]
                         track_to_pid[track_id] = person_id
                     elif not _generic_re.match(face_name) and face_name != "Unknown":
-                        # Nome real ainda não mapeado — registra se o display atual é genérico
+                        # Real name not yet mapped — register if current display name is generic
                         current_display = person_names.get(person_id, "")
                         if _generic_re.match(current_display) or not current_display or current_display == "Unknown":
-                            # Guard: não atribuir o mesmo nome real a dois tracks diferentes
+                            # Guard: don't assign the same real name to two different tracks
                             if face_name not in used_names_this_frame:
                                 person_names[person_id] = face_name
                                 emb_to_person[face_name] = person_id
                     elif _generic_re.match(face_name):
-                        # Face auto-enrolled (ex: Person_1) — avança de "Unknown" para o nome genérico
+                        # Face auto-enrolled (e.g.: Person_1) — upgrade from "Unknown" to the generic name
                         current_display = person_names.get(person_id, "")
                         if not current_display or current_display == "Unknown":
-                            # Guard: não usar o mesmo nome genérico para dois person_ids diferentes
+                            # Guard: don't use the same generic name for two different person_ids
                             name_in_use = any(
                                 pid != person_id and person_names.get(pid) == face_name
                                 for pid in track_to_pid.values()
@@ -190,7 +217,7 @@ class MultimodalFusion:
 
                 current_faces[track_id] = person_id
 
-                # Rastreia nomes reais usados neste frame para evitar colisão
+                # Track real names used in this frame to avoid collision
                 display_name_check = person_names.get(person_id, face_name)
                 if not _generic_re.match(display_name_check) and display_name_check != "Unknown":
                     used_names_this_frame[display_name_check] = track_id
@@ -202,11 +229,25 @@ class MultimodalFusion:
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                 cv2.putText(frame, label, (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            # Atualiza ASD com todos os rostos do frame atual (fora do loop para passar a lista completa)
+            # Update ASD with all faces from the current frame (outside the loop to pass the full list)
+            _t0 = time.perf_counter()
             self.asd.update(frame, results, time.time())
+            _vlog("asd_update", (time.perf_counter() - _t0) * 1000)
             self.shared_state["active_faces"] = current_faces
 
-            cv2.imshow("AV-Tracker Multimodal", frame)
+            _vlog("frame_total", (time.perf_counter() - _t0_frame) * 1000)
+            _vframe_count += 1
+            if _vframe_count % _VPERF_INTERVAL == 0:
+                _vprint_summary()
+
+            h, w = frame.shape[:2]
+            max_w, max_h = 1280, 720
+            scale = min(max_w / w, max_h / h, 1.0)
+            if scale < 1.0:
+                display = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            else:
+                display = frame
+            cv2.imshow("AV-Tracker Multimodal", display)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
@@ -215,63 +256,61 @@ class MultimodalFusion:
 
     def run(self):
         if self.video_file:
-            # Modo arquivo: inicia só threads de processamento, sem microfone
+            # File mode: start only processing threads, no microphone
             self.transcriber.start_file_mode()
             audio_thread = threading.Thread(
                 target=self._feed_file_audio, args=(self.video_file,), daemon=True
             )
             audio_thread.start()
             print("\n" + "="*60)
-            print("🎬 MODO ARQUIVO DE VÍDEO")
-            print(f"Arquivo: {self.video_file}")
+            print("🎬 VIDEO FILE MODE")
+            print(f"File: {self.video_file}")
             print("="*60 + "\n")
         else:
             audio_thread = threading.Thread(target=self.transcriber.start_recording, daemon=True)
             audio_thread.start()
             print("\n" + "="*60)
-            print("🚀 SISTEMA MULTIMODAL ATIVO")
-            print("Câmera e Microfone monitorando simultaneamente...")
+            print("🚀 MULTIMODAL SYSTEM ACTIVE")
+            print("Camera and Microphone monitoring simultaneously...")
             print("="*60 + "\n")
 
-        self.video_loop()  # main thread — necessário no Windows para cv2.imshow
+        self.video_loop()  # main thread — required on Windows for cv2.imshow
 
-        # Ao fechar o vídeo, para o áudio e salva a sessão
+        # When closing the video, stop audio and save the session
         self.transcriber.stop()
+        self.transcriber.prompt_and_save_unknown_speakers()
         transcript_file, audio_file = self.transcriber.save_session()
-        print(f"\n📝 Transcrição salva: {transcript_file}")
+        print(f"\n📝 Transcription saved: {transcript_file}")
         if audio_file:
-            print(f"🔊 Áudio salvo: {audio_file}")
+            print(f"🔊 Audio saved: {audio_file}")
 
 def setup_session_logging(log_dir: str = "realtime_sessions") -> str:
-    """Adiciona FileHandler ao root logger para salvar os logs da sessão em arquivo.
-    Bibliotecas de terceiros ruidosas (numba, urllib3, etc.) são limitadas a WARNING.
+    """Adds a FileHandler to the root logger to save session logs to a file.
+    Only logs from src.* (DEBUG+) and WARNING+ from any source are written to the file.
     """
     os.makedirs(log_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(log_dir, f"log_{ts}.txt")
 
+    class _AppFilter(logging.Filter):
+        """Only passes through logs from src.* or WARNING+ from any source."""
+        def filter(self, record):
+            return record.name.startswith("src.") or record.levelno >= logging.WARNING
+
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
+    fh.addFilter(_AppFilter())
 
-    # Root em DEBUG para capturar os nossos loggers (src.*) que já foram
-    # configurados em DEBUG por realtime_transcriber.py
+    # Root at DEBUG to capture our loggers (src.*) that were already
+    # configured at DEBUG by realtime_transcriber.py
     root = logging.getLogger()
     root.addHandler(fh)
     if root.level == logging.NOTSET or root.level > logging.DEBUG:
         root.setLevel(logging.DEBUG)
 
-    # Suprime bibliotecas de terceiros ruidosas no arquivo de log
-    _noisy = [
-        "numba", "urllib3", "matplotlib", "fsspec",
-        "speechbrain", "faster_whisper", "pyannote",
-        "torch", "torchaudio", "transformers", "huggingface_hub",
-    ]
-    for name in _noisy:
-        logging.getLogger(name).setLevel(logging.WARNING)
-
-    print(f"📋 Logs salvos em: {log_path}")
+    print(f"📋 Logs saved to: {log_path}")
     return log_path
 
 
@@ -280,34 +319,34 @@ if __name__ == "__main__":
 
     video_file = None
     while True:
-        video_file_input = input("Caminho do arquivo de vídeo (Enter para usar webcam/microfone): ").strip()
+        video_file_input = input("Path to video file (Enter to use webcam/microphone): ").strip()
         if not video_file_input:
             break
         if os.path.isfile(video_file_input):
             video_file = video_file_input
             break
-        print(f"❌ Arquivo não encontrado: {video_file_input!r} — tente novamente.")
+        print(f"❌ File not found: {video_file_input!r} — try again.")
 
     audio_device = None
     if not video_file:
         import sounddevice as _sd
-        print("\n🎤 Dispositivos de entrada disponíveis:")
+        print("\n🎤 Available input devices:")
         devices = _sd.query_devices()
         input_devices = [(i, d) for i, d in enumerate(devices) if d['max_input_channels'] > 0]
         for i, d in input_devices:
             print(f"  [{i}] {d['name']}")
         default_idx = _sd.default.device[0]
-        print(f"\nPadrão atual: [{default_idx}] {devices[default_idx]['name']}")
-        dev_input = input("Número do dispositivo de entrada (Enter para usar o padrão): ").strip()
+        print(f"\nCurrent default: [{default_idx}] {devices[default_idx]['name']}")
+        dev_input = input("Input device number (Enter to use default): ").strip()
         audio_device = int(dev_input) if dev_input.isdigit() else None
 
-    num_speakers_input = input("Quantas pessoas na reunião? (Enter para sem limite): ").strip()
+    num_speakers_input = input("How many people in the meeting? (Enter for no limit): ").strip()
     num_speakers = None
     if num_speakers_input.isdigit() and int(num_speakers_input) > 0:
         num_speakers = int(num_speakers_input)
-        print(f"Limite de speakers: {num_speakers}")
+        print(f"Speaker limit: {num_speakers}")
     else:
-        print("Sem limite de speakers")
+        print("No speaker limit")
 
     setup_session_logging()
     app = MultimodalFusion(HF_TOKEN, num_speakers=num_speakers, audio_device=audio_device, video_file=video_file)

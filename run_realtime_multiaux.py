@@ -23,64 +23,64 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 def list_audio_devices():
-    """Lista todos os dispositivos de áudio disponíveis"""
+    """Lists all available audio devices"""
     print("\n" + "="*70)
-    print("🎧 DISPOSITIVOS DE ÁUDIO DISPONÍVEIS")
+    print("🎧 AVAILABLE AUDIO DEVICES")
     print("="*70)
-    
+
     devices = sd.query_devices()
-    
+
     for i, device in enumerate(devices):
         print(f"\n[{i}] {device['name']}")
-        print(f"    Canais entrada: {device['max_input_channels']}")
-        print(f"    Canais saída: {device['max_output_channels']}")
-        print(f"    Taxa amostra: {device['default_samplerate']} Hz")
-        
-        # Marca dispositivos relevantes
+        print(f"    Input channels: {device['max_input_channels']}")
+        print(f"    Output channels: {device['max_output_channels']}")
+        print(f"    Sample rate: {device['default_samplerate']} Hz")
+
+        # Mark relevant devices
         if 'loopback' in device['name'].lower() or 'stereo mix' in device['name'].lower():
-            print(f"    ⭐ IDEAL PARA CHAMADAS/SISTEMA")
+            print(f"    ⭐ IDEAL FOR CALLS/SYSTEM")
         if 'microphone' in device['name'].lower() or 'mic' in device['name'].lower():
-            print(f"    🎤 IDEAL PARA MICROFONE")
-    
+            print(f"    🎤 IDEAL FOR MICROPHONE")
+
     return len(devices)
 
 
 def select_devices():
-    """Permite ao user selecionar quais dispositivos usar"""
+    """Allows the user to select which devices to use"""
     print("\n" + "="*70)
-    print("🎯 SELEÇÃO DE DISPOSITIVOS")
+    print("🎯 DEVICE SELECTION")
     print("="*70)
-    
+
     list_audio_devices()
-    
+
     print("\n" + "-"*70)
-    
-    # Microfone
-    mic_input = input("\nDigite o índice do MICROFONE (deixe em branco para padrão): ").strip()
+
+    # Microphone
+    mic_input = input("\nEnter the MICROPHONE index (leave blank for default): ").strip()
     mic_device = int(mic_input) if mic_input else None
-    
-    # Áudio do sistema (chamadas, música, etc)
-    system_input = input("Digite o índice para ÁUDIO DO SISTEMA/CHAMADAS (deixe em branco para pular): ").strip()
+
+    # System audio (calls, music, etc)
+    system_input = input("Enter the index for SYSTEM/CALL AUDIO (leave blank to skip): ").strip()
     system_device = int(system_input) if system_input else None
-    
-    print(f"\n✅ Configuração selecionada:")
+
+    print(f"\n✅ Selected configuration:")
     if mic_device is not None:
-        print(f"   Microfone: [{mic_device}]")
+        print(f"   Microphone: [{mic_device}]")
     else:
-        print(f"   Microfone: [padrão]")
-    
+        print(f"   Microphone: [default]")
+
     if system_device is not None:
-        print(f"   Sistema/Chamadas: [{system_device}]")
+        print(f"   System/Calls: [{system_device}]")
     else:
-        print(f"   Sistema/Chamadas: [desativado]")
-    
+        print(f"   System/Calls: [disabled]")
+
     return mic_device, system_device
 
 
-def create_multi_source_recorder(verifier, hf_token, mic_device=None, system_device=None, 
+def create_multi_source_recorder(verifier, hf_token, mic_device=None, system_device=None,
                                   whisper_size="small", **kwargs):
-    """Cria um gravador que pode capturar múltiplas fontes"""
-    
+    """Creates a recorder that can capture multiple sources"""
+
     recorder = RealtimeTranscriber(
         verifier,
         hf_token,
@@ -88,33 +88,33 @@ def create_multi_source_recorder(verifier, hf_token, mic_device=None, system_dev
         device="cuda",
         **kwargs
     )
-    
-    # Armazena info de dispositivos
+
+    # Store device info
     recorder.mic_device = mic_device
     recorder.system_device = system_device
     recorder.audio_queue_system = None
-    
-    # Se temos dispositivo de sistema, cria fila separada
+
+    # If we have a system device, create a separate queue
     if system_device is not None:
         import queue
         recorder.audio_queue_system = queue.Queue(maxsize=100)
-    
+
     return recorder
 
 
 def record_multi_source(recorder, embeddings_dir):
-    """Grava múltiplas fontes em paralelo"""
+    """Records multiple sources in parallel"""
     import threading
     import queue
     import time
-    
+
     print("\n" + "="*70)
-    print("🎤 INICIANDO GRAVAÇÃO MULTI-FONTE")
+    print("🎤 STARTING MULTI-SOURCE RECORDING")
     print("="*70)
-    
-    # Força gravação a iniciar
+
+    # Force recording to start
     recorder.running = True
-    
+
     def _get_wasapi_hostapi_index():
         try:
             for idx, api in enumerate(sd.query_hostapis()):
@@ -126,7 +126,7 @@ def record_multi_source(recorder, embeddings_dir):
 
     wasapi_index = _get_wasapi_hostapi_index()
     if wasapi_index is not None:
-        logger.info("🎧 WASAPI disponivel (indice %s)", wasapi_index)
+        logger.info("🎧 WASAPI available (index %s)", wasapi_index)
 
     def _build_wasapi_settings(loopback):
         if not hasattr(sd, "WasapiSettings"):
@@ -139,7 +139,7 @@ def record_multi_source(recorder, embeddings_dir):
         try:
             return sd.WasapiSettings(loopback=True)
         except TypeError:
-            logger.warning("⚠️ WASAPI loopback nao suportado nesta versao do sounddevice")
+            logger.warning("⚠️ WASAPI loopback not supported in this version of sounddevice")
             return None
         except Exception:
             return None
@@ -152,23 +152,23 @@ def record_multi_source(recorder, embeddings_dir):
                 audio_data = indata.copy().flatten().astype(np.float32)
                 target_queue.put(audio_data, timeout=0.01)
             except queue.Full:
-                logger.debug(f"{label}: fila cheia, descartando áudio")
+                logger.debug(f"{label}: queue full, discarding audio")
         return _callback
 
     def _open_input_stream(device, label, callback, loopback=False):
-        # 1. Busca as informações reais do dispositivo selecionado
+        # 1. Fetch actual device information
         try:
             device_info = sd.query_devices(device)
-            # Usa o samplerate nativo do dispositivo
+            # Use the device's native samplerate
             native_samplerate = device_info.get("default_samplerate", recorder.sample_rate)
-            # Lê o número máximo de canais de entrada que o dispositivo suporta
+            # Read the maximum number of input channels the device supports
             native_channels = int(device_info.get("max_input_channels", 1))
         except Exception as e:
-            logger.warning(f"⚠️ {label}: Não foi possível ler as info do dispositivo {device}. Usando padrão.")
+            logger.warning(f"⚠️ {label}: Could not read device {device} info. Using defaults.")
             native_samplerate = recorder.sample_rate
             native_channels = 1
-        
-        # Limita para 1 ou 2 canais para evitar erros com headsets bizarros (como 3 canais)
+
+        # Limit to 1 or 2 channels to avoid errors with unusual headsets (e.g. 3 channels)
         if native_channels > 2:
             native_channels = 2
 
@@ -183,9 +183,9 @@ def record_multi_source(recorder, embeddings_dir):
         try:
             return sd.InputStream(device=device, **stream_kwargs)
         except Exception as e:
-            logger.warning(f"⚠️ {label}: falha ao abrir dispositivo {device} com as configurações nativas. Tentando padrão seguro. Erro: {e}")
-            
-            # Fallback seguro: API padrão (MME/DirectSound), 1 canal, e deixa o Python escolher o sample rate.
+            logger.warning(f"⚠️ {label}: failed to open device {device} with native settings. Trying safe defaults. Error: {e}")
+
+            # Safe fallback: default API (MME/DirectSound), 1 channel, let Python choose the sample rate.
             fallback_kwargs = dict(
                 channels=1,
                 dtype=np.float32,
@@ -194,141 +194,141 @@ def record_multi_source(recorder, embeddings_dir):
             try:
                 return sd.InputStream(device=None, **fallback_kwargs)
             except Exception as e2:
-                logger.error(f"❌ Erro fatal ao tentar abrir fluxo de áudio seguro: {e2}")
+                logger.error(f"❌ Fatal error trying to open safe audio stream: {e2}")
                 raise
 
-    # Thread para capturar microfone
+    # Thread to capture microphone
     def capture_microphone():
         try:
-            logger.info("🎤 Capturando do microfone...")
-            callback = _make_callback(recorder.audio_queue, "Microfone")
-            with _open_input_stream(recorder.mic_device, "Microfone", callback):
-                print("\n" + "🔴 GRAVANDO (Microfone)")
+            logger.info("🎤 Capturing from microphone...")
+            callback = _make_callback(recorder.audio_queue, "Microphone")
+            with _open_input_stream(recorder.mic_device, "Microphone", callback):
+                print("\n" + "🔴 RECORDING (Microphone)")
                 while recorder.running:
                     time.sleep(0.2)
         except Exception as e:
-            logger.error(f"Erro na captura do microfone: {e}")
+            logger.error(f"Error capturing from microphone: {e}")
             import traceback
             traceback.print_exc()
-    
-    # Thread para capturar áudio do sistema
+
+    # Thread to capture system audio
     def capture_system_audio():
         if recorder.system_device is None:
             return
-        
+
         try:
-            logger.info("🔊 Capturando áudio do sistema...")
-            callback = _make_callback(recorder.audio_queue, "Sistema")
+            logger.info("🔊 Capturing system audio...")
+            callback = _make_callback(recorder.audio_queue, "System")
             device_index = recorder.system_device
             try:
                 info = sd.query_devices(device_index)
                 logger.info(
-                    "🔎 Sistema: %s | in=%s out=%s",
+                    "🔎 System: %s | in=%s out=%s",
                     info.get("name", "?"),
                     info.get("max_input_channels", "?"),
                     info.get("max_output_channels", "?"),
                 )
             except Exception:
-                logger.warning("⚠️ Não foi possível ler info do dispositivo %s", device_index)
+                logger.warning("⚠️ Could not read device %s info", device_index)
 
-            # Forca loopback WASAPI para capturar audio do sistema
+            # Force WASAPI loopback to capture system audio
             extra_settings = _build_wasapi_settings(loopback=True)
             if extra_settings is None:
-                logger.warning("⚠️ Loopback nao disponivel, pulando audio do sistema")
+                logger.warning("⚠️ Loopback not available, skipping system audio")
                 return
 
-            with _open_input_stream(device_index, "Sistema", callback, loopback=True):
-                print("🔴 GRAVANDO (Sistema/Chamadas)")
+            with _open_input_stream(device_index, "System", callback, loopback=True):
+                print("🔴 RECORDING (System/Calls)")
                 while recorder.running:
                     time.sleep(0.2)
         except Exception as e:
-            logger.error(f"Erro na captura do sistema: {e}")
+            logger.error(f"Error capturing system audio: {e}")
             import traceback
             traceback.print_exc()
-    
-    # Inicia threads
+
+    # Start threads
     thread_mic = threading.Thread(target=capture_microphone, daemon=False)
     thread_system = threading.Thread(target=capture_system_audio, daemon=False) if recorder.system_device else None
-    
+
     thread_mic.start()
     if thread_system:
         thread_system.start()
 
     processing_thread = threading.Thread(target=recorder._process_audio_chunks, daemon=True)
     processing_thread.start()
-    
-    logger.info("✅ Threads de captura iniciadas")
-    
-    # Inicia processamento normal
-    print("\n✨ SISTEMA PRONTO - Comece a falar!")
-    print("Pressione Ctrl+C para parar\n")
-    
+
+    logger.info("✅ Capture threads started")
+
+    # Start normal processing
+    print("\n✨ SYSTEM READY - Start speaking!")
+    print("Press Ctrl+C to stop\n")
+
     try:
-        # Loop principal - mantém gravando
+        # Main loop - keep recording
         last_status = time.time()
         while recorder.running:
             try:
                 time.sleep(0.5)
-                
-                # Status a cada 5 segundos
+
+                # Status every 5 seconds
                 if time.time() - last_status > 5.0:
                     queue_size = recorder.audio_queue.qsize() if hasattr(recorder.audio_queue, 'qsize') else 0
-                    logger.debug(f"📊 Status: {queue_size} frames na fila, running={recorder.running}")
+                    logger.debug(f"📊 Status: {queue_size} frames in queue, running={recorder.running}")
                     last_status = time.time()
-                    
+
             except Exception as e:
-                logger.error(f"Erro no loop principal: {e}")
+                logger.error(f"Error in main loop: {e}")
                 break
-                
+
     except KeyboardInterrupt:
-        print("\n⏹️ Parando gravação...")
-        logger.info("⏹️ Ctrl+C detectado")
+        print("\n⏹️ Stopping recording...")
+        logger.info("⏹️ Ctrl+C detected")
     except Exception as e:
-        logger.error(f"Erro inesperado: {e}")
+        logger.error(f"Unexpected error: {e}")
         import traceback
         traceback.print_exc()
     finally:
         recorder.running = False
-        logger.info("Aguardando threads...")
+        logger.info("Waiting for threads...")
         time.sleep(1)
         thread_mic.join(timeout=3)
         if thread_system:
             thread_system.join(timeout=3)
         processing_thread.join(timeout=3)
-        logger.info("✅ Threads finalizadas")
+        logger.info("✅ Threads finished")
 
 
 def main():
     print("\n" + "="*70)
-    print("🎙️ TRANSCRITOR MULTI-FONTE (Microfone + Chamadas)")
+    print("🎙️ MULTI-SOURCE TRANSCRIBER (Microphone + Calls)")
     print("="*70)
-    
-    # Encontra embeddings
+
+    # Find embeddings
     base_dir = os.path.abspath(os.path.dirname(__file__))
     embeddings_dir = os.path.join(base_dir, "data", "embeddings")
-    
+
     if not os.path.exists(embeddings_dir):
-        print("\n⚠️ Pasta de embeddings não encontrada, criando uma vazia.")
+        print("\n⚠️ Embeddings directory not found, creating an empty one.")
         os.makedirs(embeddings_dir)
-    
-    print(f"\n✅ Embeddings encontrados em: {embeddings_dir}")
-    
-    # Seleciona dispositivos
+
+    print(f"\n✅ Embeddings found in: {embeddings_dir}")
+
+    # Select devices
     mic_device, system_device = select_devices()
-    
-    print("\n⚙️  Inicializando sistema...")
-    
+
+    print("\n⚙️  Initializing system...")
+
     try:
-        # Carrega verifier
-        logger.info("📂 Carregando verificador de speakers...")
+        # Load verifier
+        logger.info("📂 Loading speaker verifier...")
         verifier = MultiSpeakerVerifier(embeddings_dir, threshold=0.65)
-        
-        # Carrega token HF
+
+        # Load HF token
         sys.path.insert(0, os.path.dirname(__file__))
         from src.multi_speaker_verification import HF_TOKEN
-        
-        # Cria gravador multi-source
-        logger.info("🎯 Inicializando transcritor...")
+
+        # Create multi-source recorder
+        logger.info("🎯 Initializing transcriber...")
         recorder = create_multi_source_recorder(
             verifier,
             HF_TOKEN,
@@ -340,22 +340,22 @@ def main():
             verifier_confidence_min=0.9,
             chunk_duration=2.0,
         )
-        
-        print("✅ Sistema pronto!\n")
-        
-        # Grava múltiplas fontes
+
+        print("✅ System ready!\n")
+
+        # Record multiple sources
         record_multi_source(recorder, embeddings_dir)
-        
-        # Salva resultado
+
+        # Save result
         output_file = recorder.save_session()
-        print(f"\n✅ Sessão salva em: {output_file}")
-        
+        print(f"\n✅ Session saved to: {output_file}")
+
     except KeyboardInterrupt:
-        print("\n\n⏹️ Interrompido pelo usuário")
+        print("\n\n⏹️ Interrupted by user")
         sys.exit(0)
     except Exception as e:
-        print(f"\n❌ ERRO: {e}")
-        logger.exception("Erro fatal")
+        print(f"\n❌ ERROR: {e}")
+        logger.exception("Fatal error")
         sys.exit(1)
 
 

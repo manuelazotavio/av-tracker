@@ -1,11 +1,11 @@
 """
-Active Speaker Detection (ASD) baseado em movimento labial.
+Active Speaker Detection (ASD) based on lip movement.
 
-Para cada face rastreada, computa a diferença de pixels na região da boca
-entre frames consecutivos. O speaker com maior atividade média durante o
-segmento de áudio é o candidato a speaker ativo.
+For each tracked face, computes pixel difference in the mouth region
+between consecutive frames. The speaker with the highest average activity
+during the audio segment is the active speaker candidate.
 
-Sem modelos adicionais — usa apenas os frames de câmera já processados.
+No additional models — uses only the already-processed camera frames.
 """
 
 import time
@@ -15,7 +15,7 @@ from collections import deque
 
 
 class ActiveSpeakerDetector:
-    # Região da boca: 60-100% vertical, 15-85% horizontal do bbox da face
+    # Mouth region: 60-100% vertical, 15-85% horizontal of the face bbox
     MOUTH_TOP_RATIO  = 0.60
     MOUTH_SIDE_MARGIN = 0.15
 
@@ -23,27 +23,27 @@ class ActiveSpeakerDetector:
                  dominant_ratio: float = 1.6):
         """
         Args:
-            buffer_seconds: janela de histórico mantida em memória.
-            min_frames: mínimo de frames com dados para considerar um speaker.
-            dominant_ratio: razão mínima entre o melhor e o segundo score para
-                            confirmar o speaker ativo (evita empates).
+            buffer_seconds: history window kept in memory.
+            min_frames: minimum number of frames with data to consider a speaker.
+            dominant_ratio: minimum ratio between the best and second score to
+                            confirm the active speaker (avoids ties).
         """
-        self._prev_mouth: dict[int, np.ndarray] = {}   # track_id → ROI anterior
+        self._prev_mouth: dict[int, np.ndarray] = {}   # track_id → previous ROI
         self._activity:   dict[int, deque]        = {}  # track_id → deque[(t, score)]
         self._buffer_seconds = buffer_seconds
         self._min_frames     = min_frames
         self._dominant_ratio = dominant_ratio
 
     # ------------------------------------------------------------------
-    # Atualização por frame
+    # Per-frame update
     # ------------------------------------------------------------------
     def update(self, frame: np.ndarray, face_results: list, timestamp: float | None = None) -> None:
-        """Chamado a cada frame de vídeo com os resultados do face tracker.
+        """Called every frame with the face tracker results.
 
         Args:
-            frame: BGR ou grayscale frame da câmera.
-            face_results: lista de dicts com 'track_id' e 'bbox' (x1,y1,x2,y2).
-            timestamp: epoch em segundos (default: time.time()).
+            frame: BGR or grayscale camera frame.
+            face_results: list of dicts with 'track_id' and 'bbox' (x1,y1,x2,y2).
+            timestamp: epoch in seconds (default: time.time()).
         """
         if timestamp is None:
             timestamp = time.time()
@@ -69,7 +69,7 @@ class ActiveSpeakerDetector:
 
             current_ids.add(track_id)
 
-            # Diferença de pixel em relação ao frame anterior
+            # Pixel difference relative to previous frame
             prev = self._prev_mouth.get(track_id)
             if prev is not None and prev.shape == mouth.shape:
                 diff = float(np.mean(np.abs(mouth.astype(np.float32) - prev.astype(np.float32))))
@@ -82,26 +82,26 @@ class ActiveSpeakerDetector:
                 self._activity[track_id] = deque()
             self._activity[track_id].append((timestamp, diff))
 
-            # Remove entradas antigas
+            # Remove old entries
             cutoff = timestamp - self._buffer_seconds
             buf = self._activity[track_id]
             while buf and buf[0][0] < cutoff:
                 buf.popleft()
 
-        # Limpa tracks que desapareceram da cena
+        # Clean up tracks that disappeared from the scene
         for tid in list(self._prev_mouth):
             if tid not in current_ids:
                 del self._prev_mouth[tid]
 
     # ------------------------------------------------------------------
-    # Consulta: quem estava falando em [time_start, time_end]?
+    # Query: who was speaking during [time_start, time_end]?
     # ------------------------------------------------------------------
     def get_active_speaker(self, time_start: float, time_end: float) -> int | None:
-        """Retorna track_id do speaker mais ativo na janela, ou None se incerto.
+        """Returns track_id of the most active speaker in the window, or None if uncertain.
 
         Args:
-            time_start: início do segmento de áudio (epoch seconds).
-            time_end:   fim do segmento de áudio (epoch seconds).
+            time_start: start of the audio segment (epoch seconds).
+            time_end:   end of the audio segment (epoch seconds).
         """
         scores: dict[int, float] = {}
         for track_id, buf in self._activity.items():
@@ -118,13 +118,13 @@ class ActiveSpeakerDetector:
         best_id,  best_score  = sorted_items[0]
         _,        second_score = sorted_items[1]
 
-        # Só retorna se claramente dominante
+        # Only returns if clearly dominant
         if second_score > 0 and best_score / second_score < self._dominant_ratio:
             return None
         return best_id
 
     def get_scores(self, time_start: float, time_end: float) -> dict[int, float]:
-        """Retorna scores de atividade de todas as faces (para debug)."""
+        """Returns activity scores for all faces (for debug)."""
         return {
             tid: float(np.mean([s for t, s in buf if time_start <= t <= time_end]))
             for tid, buf in self._activity.items()

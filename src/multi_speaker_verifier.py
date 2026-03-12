@@ -10,24 +10,26 @@ class MultiSpeakerVerifier:
         self.threshold = threshold
         self.embedding_directory = embedding_directory
         
-        print(f"🧠 Inicializando Verificador (Device: {self.device})")
+        print(f"🧠 Initializing Verifier (Device: {self.device})")
         print(f"   📂 Embeddings: {embedding_directory}")
-        
-        # Carrega o modelo ECAPA-TDNN (O mesmo do enrollment)
+
+        # Load the ECAPA-TDNN model (same one used for enrollment)
         self.classifier = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb", 
             run_opts={"device": self.device}
         )
         
-        # Carrega os bancos de dados na memória
+        # Load the databases into memory
         self.embeddings = {}
+        self._raw_embeddings = {}     # name → list[tensor] — for incremental centroid
+        self._auto_enroll_last = {}   # name → timestamp of last auto-enroll
         self.load_embeddings(embedding_directory)
 
     @staticmethod
     def _clean_name(base):
-        """Extrai nome limpo do filename base, removendo sufixos _auto e _YYYYMMDD_HHMMSS."""
+        """Extract clean name from filename base, removing _auto and _YYYYMMDD_HHMMSS suffixes."""
         if base.endswith("_auto"):
-            return base[:-5]
+            base = base[:-5]  # strip _auto, then continue to remove timestamp
         parts = base.split('_')
         if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
             return '_'.join(parts[:-2])
@@ -35,11 +37,11 @@ class MultiSpeakerVerifier:
 
     def load_embeddings(self, directory):
         if not os.path.exists(directory):
-            print("❌ Diretório de embeddings não encontrado!")
+            print("❌ Embeddings directory not found!")
             return
 
         self.embedding_directory = directory
-        # name -> list[tensor]: acumula embeddings por nome base
+        # name -> list[tensor]: accumulate embeddings by base name
         accumulated = {}
         count = 0
         for filename in os.listdir(directory):
@@ -59,22 +61,25 @@ class MultiSpeakerVerifier:
                     name = self._clean_name(raw_name)
                     emb_numpy = profile.get("embedding")
                     if emb_numpy is None:
-                        raise ValueError("Embedding ausente no perfil")
+                        raise ValueError("Embedding missing from profile")
                     emb_tensor = torch.from_numpy(emb_numpy).float().to(self.device)
                     accumulated.setdefault(name, []).append(emb_tensor)
                     count += 1
             except Exception as e:
-                print(f"❌ Erro ao carregar {filename}: {e}")
+                print(f"❌ Error loading {filename}: {e}")
 
-        # Agrupa embeddings do mesmo nome:
-        # - Alta similaridade entre si → mesmo falante → média (múltiplas gravações)
-        # - Baixa similaridade         → homônimos    → chaves únicas "Nome", "Nome 2", …
-        SAME_PERSON_SIM = 0.55  # abaixo disto, considera pessoas diferentes
+        # Group embeddings with the same name:
+        # - High similarity between them → same speaker → average (multiple recordings)
+        # - Low similarity               → homonyms     → unique keys "Name", "Name 2", ...
+        SAME_PERSON_SIM = 0.35  # below this, consider different people (actual homonyms)
+        # 0.35 is more permissive: same person under different conditions (indoor/outdoor, different mic)
+        # keeps in a single cluster instead of generating "Joao 2", "Joao 3" etc.
         for name, tensors in accumulated.items():
             if len(tensors) == 1:
                 self.embeddings[name] = tensors[0]
+                self._raw_embeddings[name] = list(tensors)
                 continue
-            # Agrupa por clustering guloso: cada tensor entra no grupo de maior sim
+            # Group by greedy clustering: each tensor joins the group with highest sim
             groups = []  # list of list[tensor]
             for t in tensors:
                 placed = False
@@ -92,14 +97,78 @@ class MultiSpeakerVerifier:
                 avg = torch.stack(g).mean(dim=0)
                 norm = torch.norm(avg)
                 self.embeddings[key] = avg / norm if norm > 0 else avg
+                self._raw_embeddings[key] = list(g)
                 if idx > 0:
-                    print(f"[Verifier] Homônimo detectado: '{name}' → '{key}'")
+                    print(f"[Verifier] Homonym detected: '{name}' → '{key}'")
 
         n_pessoas = len(self.embeddings)
-        print(f"   ✅ {count} arquivo(s) → {n_pessoas} pessoa(s) carregadas.")
+        print(f"   ✅ {count} file(s) → {n_pessoas} person(s) loaded.")
+
+    def auto_enroll(self, name: str, audio_np: np.ndarray,
+                    max_total: int = 8, cooldown_s: float = 300.0,
+                    min_sim: float = 0.65, max_sim: float = 0.96) -> bool:
+        """
+        Automatically saves a voice embedding when identification was high confidence.
+        - max_total   : max .npy files per person on disk (includes manual ones)
+        - cooldown_s  : minimum seconds between auto-enrolls for the same speaker (default: 5min)
+        - min_sim     : minimum sim with current centroid — sanity check (is this not the person?)
+        - max_sim     : maximum sim — if we already have something identical, it adds no diversity
+        Returns True if a new embedding was saved.
+        """
+        import time
+        from datetime import datetime as _dt
+
+        # Cooldown per speaker
+        now = time.time()
+        if now - self._auto_enroll_last.get(name, 0.0) < cooldown_s:
+            return False
+
+        # Total file limit on disk for this name
+        if self.embedding_directory and os.path.exists(self.embedding_directory):
+            n_on_disk = sum(
+                1 for f in os.listdir(self.embedding_directory)
+                if f.endswith(".npy") and self._clean_name(os.path.splitext(f)[0]) == name
+            )
+            if n_on_disk >= max_total:
+                return False
+
+        # Extract embedding from audio
+        signal = torch.from_numpy(audio_np).float().to(self.device)
+        if signal.dim() == 1:
+            signal = signal.unsqueeze(0)
+        with torch.no_grad():
+            emb = self.classifier.encode_batch(signal).squeeze()
+        norm = torch.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+
+        # Sanity check against current centroid
+        if name in self.embeddings:
+            centroid = self.embeddings[name]
+            sim = torch.nn.functional.cosine_similarity(emb, centroid, dim=0).item()
+            if sim < min_sim:
+                return False  # not this person
+            if sim > max_sim:
+                return False  # identical to what we already have — adds no diversity
+
+        # Save to disk
+        ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"{name}_{ts}_auto.npy"
+        fpath = os.path.join(self.embedding_directory, fname)
+        np.save(fpath, emb.cpu().numpy())
+
+        # Update centroid in memory with exact incremental average
+        raws = self._raw_embeddings.setdefault(name, [])
+        raws.append(emb)
+        new_avg = torch.stack(raws).mean(dim=0)
+        nn = torch.norm(new_avg)
+        self.embeddings[name] = new_avg / nn if nn > 0 else new_avg
+
+        self._auto_enroll_last[name] = now
+        return True
 
     def _process_audio_chunk(self, audio_chunk, sample_rate=16000):
-        # 1. Prepara o áudio (Garante Tensor [1, Time])
+        # 1. Prepare the audio (Ensure Tensor [1, Time])
         if isinstance(audio_chunk, np.ndarray):
             signal = torch.from_numpy(audio_chunk).float().to(self.device)
         else:
@@ -108,22 +177,22 @@ class MultiSpeakerVerifier:
         if signal.dim() == 1:
             signal = signal.unsqueeze(0)
 
-        # 2. Extrai o embedding da voz atual (Separada)
+        # 2. Extract the embedding of the current voice (Separated)
         with torch.no_grad():
-            # O classifier retorna [1, 1, 192], fazemos squeeze para [192]
+            # The classifier returns [1, 1, 192], we squeeze to [192]
             output = self.classifier.encode_batch(signal)
             current_embedding = output.squeeze()
 
-        # 3. Compara com todos os atores do banco
+        # 3. Compare with all speakers in the database
         best_score = -1.0
         best_speaker = "Unknown"
 
-        # Variável para debug visual (apenas se for sobreposição/separado)
+        # Variable for visual debug (only if overlap/separated)
         debug_scores = []
 
         for speaker, stored_embedding in self.embeddings.items():
-            # Similaridade de Cosseno (PyTorch)
-            # A stored_embedding também precisa estar no mesmo device
+            # Cosine Similarity (PyTorch)
+            # The stored_embedding also needs to be on the same device
             score = torch.nn.functional.cosine_similarity(current_embedding, stored_embedding, dim=0).item()
             
             debug_scores.append((speaker, score))
@@ -132,33 +201,39 @@ class MultiSpeakerVerifier:
                 best_score = score
                 best_speaker = speaker
 
-        # 4. Lógica de decisão
-        
-        # Ordena para vermos os top 3 no log
+        # 4. Decision logic
+
+        # Sort to see top 3 in the log
         debug_scores.sort(key=lambda x: x[1], reverse=True)
         top_3 = debug_scores[:3]
         
-        # Se a pontuação for muito baixa, imprimimos para entender o drama
+        # If the score is too low, we print to understand what's going on
         if best_score < 0.25:
-            # Monta string de debug
+            # Build debug string
             top_str = " | ".join([f"{n}: {s:.1%}" for n, s in top_3])
-            # Descomente a linha abaixo se quiser ver TODOS os comparativos no terminal
-            # print(f"   📊 Comparativo: {top_str}")
+            # Uncomment the line below to see ALL comparisons in the terminal
+            # print(f"   📊 Comparison: {top_str}")
 
-        # Retorna (best, score, todos_candidatos_acima_do_threshold)
-        # O chamador aplica gender check e margin check com contexto completo.
+        # Return (best, score, all_candidates_above_threshold)
+        # Margin check: require minimum margin over the runner-up to avoid
+        # ambiguous attribution when two embeddings have similar sim.
+        second_score = debug_scores[1][1] if len(debug_scores) >= 2 else -1.0
+        margin = best_score - second_score
         candidates = [(name, sc) for name, sc in debug_scores if sc >= self.threshold]
-        if best_score >= self.threshold:
+        if best_score >= self.threshold and margin >= 0.07:
             return best_speaker, best_score, candidates
         else:
-            return "Unknown", best_score, candidates
+            # Return actual best name even below threshold so callers can log/diagnose it.
+            # Callers should check len(candidates)==0 (or best_score < threshold) to
+            # decide whether to trust the result for attribution.
+            return best_speaker, best_score, candidates
 
     def rename_embedding(self, old_name, new_name):
-        """Renomeia embeddings de voz em memória e em disco quando o nome real é detectado."""
-        # Atualiza chave em memória (chaves são nomes limpos)
+        """Renames voice embeddings in memory and on disk when the real name is detected."""
+        # Update key in memory (keys are clean names)
         if old_name in self.embeddings:
             self.embeddings[new_name] = self.embeddings.pop(old_name)
-        # Renomeia arquivos em disco cujo nome base começa com old_name
+        # Rename files on disk whose base name starts with old_name
         if self.embedding_directory and os.path.exists(self.embedding_directory):
             for fname in os.listdir(self.embedding_directory):
                 if not fname.endswith(".npy"):
@@ -170,4 +245,4 @@ class MultiSpeakerVerifier:
                     new_path = os.path.join(self.embedding_directory, new_fname)
                     if not os.path.exists(new_path):
                         os.rename(old_path, new_path)
-                        print(f"[Verifier] Renomeado '{fname}' -> '{new_fname}'")
+                        print(f"[Verifier] Renamed '{fname}' -> '{new_fname}'")

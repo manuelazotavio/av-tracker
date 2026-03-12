@@ -60,22 +60,22 @@ class LargeMeetingTranscriber:
         self.verifier_confidence_min = verifier_confidence_min
         self.min_segment_duration = min_segment_duration
         
-        logger.info("Autenticando...")
+        logger.info("Authenticating...")
         login(token=hf_token)
         
         if use_ai_analysis:
-            logger.info("Carregando modelo NER (spaCy)...")
+            logger.info("Loading NER model (spaCy)...")
             try:
                 self.nlp = spacy.load("pt_core_news_lg")
             except OSError:
-                logger.warning("Modelo pt_core_news_lg não encontrado. Tentando pt_core_news_sm...")
+                logger.warning("Model pt_core_news_lg not found. Trying pt_core_news_sm...")
                 try:
                     self.nlp = spacy.load("pt_core_news_sm")
                 except OSError:
-                    logger.warning("spaCy não disponível. Instale com: python -m spacy download pt_core_news_sm")
+                    logger.warning("spaCy not available. Install with: python -m spacy download pt_core_news_sm")
                     self.nlp = None
             
-            logger.info("Carregando LLM para análise contextual...")
+            logger.info("Loading LLM for contextual analysis...")
             try:
                 self.llm = hf_pipeline(
                     model="google/flan-t5-small",
@@ -83,13 +83,13 @@ class LargeMeetingTranscriber:
                     max_length=512
                 )
             except Exception as e:
-                logger.warning(f"LLM não disponível: {e}")
+                logger.warning(f"LLM not available: {e}")
                 self.llm = None
         else:
             self.nlp = None
             self.llm = None
 
-        logger.info("Carregando PyAnnote...")
+        logger.info("Loading PyAnnote...")
         self.pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1"
         ).to(torch.device(device))
@@ -101,18 +101,18 @@ class LargeMeetingTranscriber:
                     "segmentation": {"threshold": 0.4} 
                 })
                 logger.info(
-                    f"Clustering threshold ajustado: {self.diarization_clustering_threshold}"
+                    f"Clustering threshold set: {self.diarization_clustering_threshold}"
                 )
-                logger.info("Segmentation threshold ajustado: 0.4")
+                logger.info("Segmentation threshold set: 0.4")
             except Exception as e:
-                logger.warning(f"Falha ao ajustar thresholds: {e}")
+                logger.warning(f"Failed to set thresholds: {e}")
 
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
-        logger.info("Carregando SepFormer...")
+        logger.info("Loading SepFormer...")
         local_path = "pretrained_models/sepformer"
         sepformer_source = local_path
         if not os.path.exists(os.path.join(local_path, "hyperparams.yaml")):
-            logger.warning("SepFormer local nao encontrado. Baixando modelo...")
+            logger.warning("Local SepFormer not found. Downloading model...")
             snapshot_download(
                 repo_id="speechbrain/sepformer-whamr",
                 local_dir=local_path,
@@ -126,14 +126,14 @@ class LargeMeetingTranscriber:
             run_opts={"device": device}
         )
 
-        logger.info(f"Carregando Whisper ({whisper_size})...")
+        logger.info(f"Loading Whisper ({whisper_size})...")
         try:
             self.whisper = WhisperModel(whisper_size, device="cpu", compute_type="float16")
-            logger.info("Usando compute_type: float16")
+            logger.info("Using compute_type: float16")
         except Exception as e:
-            logger.warning(f"float16 não suportado ({e}), usando int8...")
+            logger.warning(f"float16 not supported ({e}), using int8...")
             self.whisper = WhisperModel(whisper_size, device="cpu", compute_type="int8")
-            logger.info("Usando compute_type: int8")
+            logger.info("Using compute_type: int8")
 
     def normalize_text(self, text):
         text = text.lower()
@@ -213,13 +213,13 @@ Answer (only list speakers with confirmed human names):"""
             for speaker_id, name in matches:
                 if name.lower() not in invalid_names and len(name) >= 3:
                     speaker_names[speaker_id] = name
-                    logger.info(f"LLM detectou: {speaker_id} = {name}")
+                    logger.info(f"LLM detected: {speaker_id} = {name}")
                 else:
-                    logger.debug(f"LLM retornou nome inválido: {name}")
+                    logger.debug(f"LLM returned invalid name: {name}")
             
             return speaker_names
         except Exception as e:
-            logger.warning(f"Erro na análise LLM: {e}")
+            logger.warning(f"LLM analysis error: {e}")
             return {}
     
     def associate_names_with_speakers(self, transcript):
@@ -237,6 +237,10 @@ Answer (only list speakers with confirmed human names):"""
             speaker = entry['speaker']
             text = entry['text']
             
+            # Portuguese self-introduction patterns:
+            # "meu nome é" = "my name is", "me chamo" = "I'm called",
+            # "eu sou" = "I am", "sou o/sou a" = "I am (masc/fem)"
+            # "aqui é" = "this is", "aqui quem fala é" = "the one speaking here is"
             self_intro_patterns = [
                 r'(?:meu nome é|me chamo|eu sou|sou o|sou a)\s+([A-ZÀ-Ú][a-zà-ú]+)',
                 r'(?:aqui é|aqui quem fala é)\s+(?:o|a)?\s*([A-ZÀ-Ú][a-zà-ú]+)',
@@ -247,13 +251,13 @@ Answer (only list speakers with confirmed human names):"""
                 if match:
                     name = match.group(1).capitalize()
                     self_introductions[speaker] = name
-                    logger.info(f"Auto-apresentação: {speaker} = {name}")
+                    logger.info(f"Self-introduction: {speaker} = {name}")
             
             detected_names = []
             if self.nlp:
                 detected_names = self.extract_names_with_ner(text)
                 if detected_names:
-                    logger.debug(f"NER extraiu de '{text[:50]}...': {detected_names}")
+                    logger.debug(f"NER extracted from '{text[:50]}...': {detected_names}")
             
             regex_name_pattern = r'^\s*([A-ZÀ-Ú][a-zà-úç]{2,15})\s*[,!]'
             regex_match = re.search(regex_name_pattern, text)
@@ -271,8 +275,8 @@ Answer (only list speakers with confirmed human names):"""
                 if potential_name.lower() in common_names and potential_name.lower() not in tech_terms:
                     if potential_name not in detected_names:
                         detected_names.append(potential_name)
-                        logger.debug(f"Regex detectou nome: '{potential_name}' em '{text[:50]}...'")
-            
+                        logger.debug(f"Regex detected name: '{potential_name}' in '{text[:50]}...'")
+
             for name in detected_names:
                 vocative_pattern = rf'^\s*{re.escape(name)}\s*[,!]'
                 if re.search(vocative_pattern, text, re.IGNORECASE):
@@ -280,18 +284,18 @@ Answer (only list speakers with confirmed human names):"""
                     
                     if i + 1 < len(transcript):
                         target_speaker = transcript[i + 1]['speaker']
-                        logger.info(f"Vocativo detectado: '{name}' em '{text[:60]}...' -> próximo speaker é {target_speaker}")
+                        logger.info(f"Vocative detected: '{name}' in '{text[:60]}...' -> next speaker is {target_speaker}")
                     else:
                         all_speakers = set(e['speaker'] for e in transcript)
                         other_speakers = all_speakers - {speaker}
                         if len(other_speakers) == 1:
                             target_speaker = list(other_speakers)[0]
-                            logger.info(f"Vocativo detectado (último turno): '{name}' em '{text[:60]}...' -> outro speaker é {target_speaker}")
+                            logger.info(f"Vocative detected (last turn): '{name}' in '{text[:60]}...' -> other speaker is {target_speaker}")
                         elif len(other_speakers) > 1:
                             for j in range(i - 1, -1, -1):
                                 if transcript[j]['speaker'] != speaker:
                                     target_speaker = transcript[j]['speaker']
-                                    logger.info(f"Vocativo detectado: '{name}' em '{text[:60]}...' -> speaker anterior é {target_speaker}")
+                                    logger.info(f"Vocative detected: '{name}' in '{text[:60]}...' -> previous speaker is {target_speaker}")
                                     break
                     
                     if target_speaker:
@@ -308,7 +312,7 @@ Answer (only list speakers with confirmed human names):"""
                 most_likely_speaker = max(responding_speakers.items(), key=lambda x: x[1])[0]
                 if most_likely_speaker not in speaker_names:
                     speaker_names[most_likely_speaker] = name
-                    logger.info(f"Vocativo: {most_likely_speaker} = {name} (chamado {responding_speakers[most_likely_speaker]}x)")
+                    logger.info(f"Vocative: {most_likely_speaker} = {name} (called {responding_speakers[most_likely_speaker]}x)")
         
         invalid_terms = {'kotlin', 'java', 'python', 'javascript', 'react', 'angular', 'node'}
         for name, responding_speakers in speaker_mentions.items():
@@ -317,7 +321,7 @@ Answer (only list speakers with confirmed human names):"""
                 if most_likely_speaker not in speaker_names:
                     if responding_speakers[most_likely_speaker] >= 2:
                         speaker_names[most_likely_speaker] = name
-                        logger.info(f"Contextual: {most_likely_speaker} = {name} (mencionado {responding_speakers[most_likely_speaker]}x antes de responder)")
+                        logger.info(f"Contextual: {most_likely_speaker} = {name} (mentioned {responding_speakers[most_likely_speaker]}x before responding)")
         
         return speaker_names
     
@@ -327,7 +331,7 @@ Answer (only list speakers with confirmed human names):"""
         if not unknown_speakers_audio:
             return
         
-        logger.info("\nCriando embeddings para novos speakers...")
+        logger.info("\nCreating embeddings for new speakers...")
         
         classifier = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
@@ -340,7 +344,7 @@ Answer (only list speakers with confirmed human names):"""
             actual_name = speaker_names.get(speaker_id, None)
             
             if not actual_name:
-                logger.info(f"{speaker_id}: Nenhum nome detectado, pulando...")
+                logger.info(f"{speaker_id}: No name detected, skipping...")
                 continue
             
             if len(audio_chunks) == 0:
@@ -364,28 +368,28 @@ Answer (only list speakers with confirmed human names):"""
             filepath = os.path.join(embeddings_dir, filename)
             
             np.save(filepath, embedding)
-            logger.info(f"Salvo: {filepath}")
+            logger.info(f"Saved: {filepath}")
             saved_count += 1
         
         if saved_count > 0:
-            logger.info(f"\n{saved_count} novo(s) embedding(s) criado(s) com sucesso!")
-            logger.info("Reinicie o sistema para carregar os novos embeddings.")
+            logger.info(f"\n{saved_count} new embedding(s) created successfully!")
+            logger.info("Restart the system to load new embeddings.")
 
     def process_audio(self, audio_path, embeddings_dir=None, num_speakers=None):
         if not os.path.exists(audio_path):
-            raise FileNotFoundError(f"Arquivo não encontrado: {audio_path}")
+            raise FileNotFoundError(f"File not found: {audio_path}")
         
         start_total = time.time()
         logger.info(f"\n{'='*60}")
-        logger.info(f"Processando: {audio_path}")
+        logger.info(f"Processing: {audio_path}")
         if num_speakers:
-            logger.info(f"Limitando para MÁXIMO {num_speakers} speaker(s)")
+            logger.info(f"Limiting to MAXIMUM {num_speakers} speaker(s)")
         logger.info(f"{'='*60}")
         
         start = time.time()
         waveform, sample_rate = torchaudio.load(audio_path)
         elapsed = time.time() - start
-        logger.info(f"Carregamento de áudio: {elapsed:.2f}s")
+        logger.info(f"Audio loading: {elapsed:.2f}s")
         
         start = time.time()
         diarization_params = {}
@@ -396,7 +400,7 @@ Answer (only list speakers with confirmed human names):"""
         diarization = self.pipeline(audio_path, **diarization_params)
         overlap_timeline = diarization.get_overlap()
         elapsed = time.time() - start
-        logger.info(f"Diarização (identificação de speakers): {elapsed:.2f}s")
+        logger.info(f"Diarization (speaker identification): {elapsed:.2f}s")
         
         resample_to_8k = T.Resample(sample_rate, 8000)
         resample_to_16k = T.Resample(8000, 16000)
@@ -410,29 +414,29 @@ Answer (only list speakers with confirmed human names):"""
         transcribed_segments = 0
         
         start_transcription = time.time()
-        logger.info("\nTranscrevendo segmentos...")
+        logger.info("\nTranscribing segments...")
 
         for turn, _, speaker_id in diarization.itertracks(yield_label=True):
             duration = turn.end - turn.start
             
             if duration < self.min_segment_duration:
                 logger.debug(
-                    f"[{turn.start:.1f}s] Segmento muito curto ({duration:.2f}s), pulando..."
+                    f"[{turn.start:.1f}s] Segment too short ({duration:.2f}s), skipping..."
                 )
                 continue
             
             effective_end = turn.end
             if duration > 30.0:
-                logger.debug(f"[{turn.start:.1f}s] Segmento muito longo ({duration:.2f}s), limitando a 30s...")
+                logger.debug(f"[{turn.start:.1f}s] Segment too long ({duration:.2f}s), limiting to 30s...")
                 effective_end = turn.start + 30.0
             
             total_segments += 1
-            logger.debug(f"[{turn.start:.1f}s - {effective_end:.1f}s] Processando {speaker_id} ({effective_end - turn.start:.2f}s)")
+            logger.debug(f"[{turn.start:.1f}s - {effective_end:.1f}s] Processing {speaker_id} ({effective_end - turn.start:.2f}s)")
             
             start_frame = int(turn.start * sample_rate)
             end_frame = int(effective_end * sample_rate)
             if start_frame >= waveform.shape[1]:
-                logger.debug(f"[{turn.start:.1f}s] Frame fora dos limites, pulando...")
+                logger.debug(f"[{turn.start:.1f}s] Frame out of bounds, skipping...")
                 continue
             
             audio_segment = waveform[:, start_frame:end_frame]
@@ -448,7 +452,7 @@ Answer (only list speakers with confirmed human names):"""
 
             if is_overlap:
                 start_sep = time.time()
-                logger.info(f"Sobreposição em {turn.start:.1f}s. Separando...")
+                logger.info(f"Overlap at {turn.start:.1f}s. Separating...")
                 mono = torch.mean(audio_segment, dim=0) if audio_segment.shape[0] > 1 else audio_segment.squeeze(0)
                 mono_8k = resample_to_8k(mono)
                 mono_8k_input = mono_8k.unsqueeze(0)
@@ -463,9 +467,9 @@ Answer (only list speakers with confirmed human names):"""
                     
                     sources_to_transcribe = [src1_16k, src2_16k]
                     elapsed_sep = time.time() - start_sep
-                    logger.info(f"Separação: {elapsed_sep:.2f}s")
+                    logger.info(f"Separation: {elapsed_sep:.2f}s")
                 except Exception as e:
-                    logger.error(f"Falha na separação: {e}. Usando áudio original.")
+                    logger.error(f"Separation failed: {e}. Using original audio.")
                     sources_to_transcribe = [resample_orig_to_16k(audio_segment).squeeze().numpy()]
             else:
                 audio_16k = resample_orig_to_16k(audio_segment)
@@ -475,16 +479,16 @@ Answer (only list speakers with confirmed human names):"""
                 source_np = source_np.squeeze()
                 
                 if source_np.ndim == 2:
-                    logger.debug(f"Convertendo estéreo para mono...")
+                    logger.debug(f"Converting stereo to mono...")
                     source_np = np.mean(source_np, axis=0)
                 
                 if source_np.ndim != 1 or source_np.size == 0:
-                    logger.debug(f"[{turn.start:.1f}s] Voz {idx+1}: Áudio inválido (ndim={source_np.ndim}, size={source_np.size}), pulando...")
+                    logger.debug(f"[{turn.start:.1f}s] Voice {idx+1}: Invalid audio (ndim={source_np.ndim}, size={source_np.size}), skipping...")
                     continue
                 
                 mx = np.abs(source_np).max()
                 if np.isnan(mx) or mx == 0:
-                    logger.debug(f"[{turn.start:.1f}s] Voz {idx+1}: Áudio silencioso (max={mx}), pulando...")
+                    logger.debug(f"[{turn.start:.1f}s] Voice {idx+1}: Silent audio (max={mx}), skipping...")
                     continue
                 source_np = source_np / mx
                 
@@ -494,7 +498,7 @@ Answer (only list speakers with confirmed human names):"""
                     unknown_speakers_audio[speaker_id].append(source_np.copy())
                 
                 if is_overlap:
-                    print(f"[DEBUG] Voz {idx+1}: {real_name} ({conf:.1%})")
+                    print(f"[DEBUG] Voice {idx+1}: {real_name} ({conf:.1%})")
 
                 verified_name = None
                 if real_name != "Unknown" and conf >= self.verifier_confidence_min:
@@ -524,14 +528,14 @@ Answer (only list speakers with confirmed human names):"""
                     text = " ".join([s.text for s in segs]).strip()
                     elapsed_whisper = time.time() - start_whisper
                     
-                    logger.debug(f"Whisper: {elapsed_whisper:.2f}s, resultado: '{text[:50]}...'")
+                    logger.debug(f"Whisper: {elapsed_whisper:.2f}s, result: '{text[:50]}...'")
                     
                     if not text:
-                        logger.debug(f"[{turn.start:.1f}s] {speaker_id}: Whisper retornou vazio, pulando...")
+                        logger.debug(f"[{turn.start:.1f}s] {speaker_id}: Whisper returned empty, skipping...")
                         continue
                     
                     if "Amara.org" in text:
-                        logger.debug(f"[{turn.start:.1f}s] {speaker_id}: Detectado watermark, pulando...")
+                        logger.debug(f"[{turn.start:.1f}s] {speaker_id}: Watermark detected, skipping...")
                         continue
                     
                     clean_new = self.normalize_text(text)
@@ -547,14 +551,14 @@ Answer (only list speakers with confirmed human names):"""
                                 is_duplicate = True
                     
                     if is_duplicate:
-                        logger.debug(f"[{turn.start:.1f}s] {disp}: Duplicata (similar>{ratio:.0%}), pulando...")
+                        logger.debug(f"[{turn.start:.1f}s] {disp}: Duplicate (similar>{ratio:.0%}), skipping...")
                         continue
                     
                     transcribed_segments += 1
                     speaker_history[disp] = {'clean_text': clean_new, 'time': turn.start}
 
-                    suffix = f" (Voz {idx+1})" if is_overlap else ""
-                    logger.debug(f"[{turn.start:.1f}s] {display_label}{suffix}: TRANSCRITO")
+                    suffix = f" (Voice {idx+1})" if is_overlap else ""
+                    logger.debug(f"[{turn.start:.1f}s] {display_label}{suffix}: TRANSCRIBED")
                     print(f" [{turn.start:.1f}s] {display_label}{suffix}: {text}")
                     
                     full_transcript.append({
@@ -565,30 +569,30 @@ Answer (only list speakers with confirmed human names):"""
                         "suffix": suffix
                     })
                 except Exception as e:
-                    logger.error(f"Erro Whisper: {e}")
+                    logger.error(f"Whisper error: {e}")
         
         elapsed_transcription = time.time() - start_transcription
-        logger.info(f"\nTranscrição total: {elapsed_transcription:.2f}s")
+        logger.info(f"\nTotal transcription: {elapsed_transcription:.2f}s")
         
         coverage_rate = (transcribed_segments / total_segments * 100) if total_segments > 0 else 0
         unique_speakers = len(set(line['speaker'] for line in full_transcript))
-        logger.info(f"\nESTATÍSTICAS DE TRANSCRIÇÃO:")
-        logger.info(f"Segmentos processados: {total_segments}")
-        logger.info(f"Segmentos transcritos: {transcribed_segments}")
-        logger.info(f"Taxa de cobertura: {coverage_rate:.1f}%")
-        logger.info(f"Speakers únicos: {unique_speakers}")
+        logger.info(f"\nTRANSCRIPTION STATISTICS:")
+        logger.info(f"Segments processed: {total_segments}")
+        logger.info(f"Segments transcribed: {transcribed_segments}")
+        logger.info(f"Coverage rate: {coverage_rate:.1f}%")
+        logger.info(f"Unique speakers: {unique_speakers}")
         
         if unknown_speakers_audio:
             start_names = time.time()
-            logger.info(f"\nDetectados {len(unknown_speakers_audio)} speaker(s) desconhecido(s)")
-            logger.info("Analisando transcrição para identificar nomes...")
+            logger.info(f"\nDetected {len(unknown_speakers_audio)} unknown speaker(s)")
+            logger.info("Analyzing transcript to identify names...")
             
             speaker_names = self.associate_names_with_speakers(full_transcript)
             
             if speaker_names:
                 elapsed_names = time.time() - start_names
-                logger.info(f"\nNomes identificados: {speaker_names}")
-                logger.info(f"Detecção de nomes: {elapsed_names:.2f}s")
+                logger.info(f"\nNames identified: {speaker_names}")
+                logger.info(f"Name detection: {elapsed_names:.2f}s")
                 
                 embeddings_dir = embeddings_dir or "../data/embeddings"
                 if not os.path.exists(embeddings_dir):
@@ -597,13 +601,13 @@ Answer (only list speakers with confirmed human names):"""
                 start_embeddings = time.time()
                 self.save_new_embeddings(unknown_speakers_audio, speaker_names, embeddings_dir)
                 elapsed_embeddings = time.time() - start_embeddings
-                logger.info(f"Criação de embeddings: {elapsed_embeddings:.2f}s")
+                logger.info(f"Embedding creation: {elapsed_embeddings:.2f}s")
             else:
-                logger.info("Nenhum nome foi identificado na conversa")
+                logger.info("No name was identified in the conversation")
         
         elapsed_total = time.time() - start_total
         logger.info(f"\n{'='*60}")
-        logger.info(f"TEMPO TOTAL: {elapsed_total:.2f}s")
+        logger.info(f"TOTAL TIME: {elapsed_total:.2f}s")
         logger.info(f"{'='*60}")
         
         return full_transcript
@@ -616,10 +620,10 @@ if __name__ == "__main__":
     ]
     embeddings_dir = next((d for d in candidate_dirs if os.path.exists(d)), None)
     if not embeddings_dir:
-        print("Pasta de embeddings não encontrada")
+        print("Embeddings directory not found")
         exit()
 
-    print("Inicializando...")
+    print("Initializing...")
     try:
         verifier = MultiSpeakerVerifier(embeddings_dir, threshold=0.65)
         system = LargeMeetingTranscriber(
@@ -631,29 +635,29 @@ if __name__ == "__main__":
         )
 
         while True:
-            f = input("\nArquivo: ").strip()
+            f = input("\nFile: ").strip()
             if f in ['sair', 'exit']:
                 break
             path = f if os.path.exists(f) else f"../data/testes/{f}"
             
             if os.path.exists(path):
-                num_speakers_input = input("Número MÁXIMO de speakers (Enter para detectar automaticamente): ").strip()
+                num_speakers_input = input("MAXIMUM number of speakers (Enter for automatic detection): ").strip()
                 num_speakers = None
                 if num_speakers_input.isdigit():
                     num_speakers = int(num_speakers_input)
-                    print(f"Limitando para máximo {num_speakers} speaker(s)")
+                    print(f"Limiting to maximum {num_speakers} speaker(s)")
                 else:
-                    print("Detecção automática de speakers")
+                    print("Automatic speaker detection")
                 
                 transcript_result = system.process_audio(path, embeddings_dir, num_speakers=num_speakers)
                 
                 base_name = os.path.splitext(os.path.basename(path))[0]
-                output_filename = f"{base_name}_transcricao.txt"
+                output_filename = f"{base_name}_transcript.txt"
                 
                 if transcript_result:
-                    print(f"\nSalvando transcrição em: {output_filename} ...")
+                    print(f"\nSaving transcript to: {output_filename} ...")
                     with open(output_filename, "w", encoding="utf-8") as txt_file:
-                        txt_file.write(f"ARQUIVO: {f}\n")
+                        txt_file.write(f"FILE: {f}\n")
                         txt_file.write("-" * 50 + "\n\n")
                         
                         for line in transcript_result:
@@ -667,10 +671,10 @@ if __name__ == "__main__":
                             else:
                                 txt_file.write(f"{timestamp} {speaker}{suffix}: {text}\n")
                     
-                    print(f"Arquivo '{output_filename}' salvo com sucesso!")
+                    print(f"File '{output_filename}' saved successfully!")
                 else:
-                    print("Nenhuma fala detectada.")
+                    print("No speech detected.")
             else:
-                print("Arquivo não existe.")
+                print("File does not exist.")
     except Exception as e:
-        logger.error(f"Erro Fatal: {e}")
+        logger.error(f"Fatal error: {e}")

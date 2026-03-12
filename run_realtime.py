@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Script simples para executar o Transcritor em Tempo Real
-Pressione ENTER para começar, Ctrl+C para parar
+Simple script to run the Real-Time Transcriber
+Press ENTER to start, Ctrl+C to stop
 """
 
 import os
@@ -16,10 +16,10 @@ logger = logging.getLogger(__name__)
 
 def main():
     print("\n" + "="*70)
-    print("🎙️  TRANSCRITOR EM TEMPO REAL - GRAVAÇÃO COM MICROFONE")
+    print("🎙️  REAL-TIME TRANSCRIBER - MICROPHONE RECORDING")
     print("="*70)
     
-    # Encontra diretório de embeddings
+    # Find embeddings directory
     base_dir = os.path.abspath(os.path.dirname(__file__))
     candidate_dirs = [
         os.path.join(base_dir, "data", "embeddings"),
@@ -28,27 +28,27 @@ def main():
     embeddings_dir = next((d for d in candidate_dirs if os.path.exists(d)), None)
     
     if not embeddings_dir:
-        print("\n❌ ERRO: Pasta de embeddings não encontrada!")
-        print(f"Procurei em:")
+        print("\n❌ ERROR: Embeddings directory not found!")
+        print(f"Searched in:")
         for d in candidate_dirs:
             print(f"  - {d}")
-        print("\nExecute primeiro: python src/create_embeddings_from_audio.py --help")
+        print("\nRun first: python src/create_embeddings_from_audio.py --help")
         sys.exit(1)
     
-    print(f"\n✅ Embeddings encontrados em: {embeddings_dir}")
-    print("\n⚙️  Inicializando sistema...")
-    print("(Isto pode levar 1-3 minutos na primeira vez)\n")
+    print(f"\n✅ Embeddings found in: {embeddings_dir}")
+    print("\n⚙️  Initializing system...")
+    print("(This may take 1-3 minutes the first time)\n")
     
     try:
-        # Carrega verificador
-        print("📂 Carregando verificador de speakers...")
+        # Load verifier
+        print("📂 Loading speaker verifier...")
         verifier = MultiSpeakerVerifier(embeddings_dir, threshold=0.65)
-        print("✅ Verificador carregado\n")
+        print("✅ Verifier loaded\n")
         
-        # Cria transcritor em tempo real
-        print("🎯 Inicializando transcritor em tempo real...")
+        # Create real-time transcriber
+        print("🎯 Initializing real-time transcriber...")
         
-        # Obtém token HF
+        # Get HF token
         sys.path.insert(0, os.path.dirname(__file__))
         from src.multi_speaker_verification import HF_TOKEN
         
@@ -56,42 +56,42 @@ def main():
             verifier,
             HF_TOKEN,
             whisper_size="small",
-            device="cpu",  # Forçado para CPU (PyTorch CPU-only neste ambiente)
+            device="cpu",  # Forced to CPU (PyTorch CPU-only in this environment)
             use_ai_analysis=True,
             diarization_clustering_threshold=0.45,
             verifier_confidence_min=0.9,
             chunk_duration=2.0,
         )
-        print("✅ Transcritor carregado e pronto!\n")
+        print("✅ Transcriber loaded and ready!\n")
         
-        # Menu de opções
+        # Options menu
         print("="*70)
-        print("📋 OPÇÕES")
+        print("📋 OPTIONS")
         print("="*70)
-        print("\n1️⃣  Modo Normal - Detectar automaticamente speakers")
-        print("2️⃣  Modo Personalizado - Configurar parâmetros")
-        print("3️⃣  Sair")
-        
-        choice = input("\nEscolha uma opção (1-3): ").strip()
+        print("\n1️⃣  Normal Mode - Automatically detect speakers")
+        print("2️⃣  Custom Mode - Configure parameters")
+        print("3️⃣  Exit")
+
+        choice = input("\nChoose an option (1-3): ").strip()
         
         if choice == "3":
-            print("\n👋 Até logo!")
+            print("\n👋 Goodbye!")
             return
         elif choice == "2":
-            print("\n⚙️  CONFIGURAÇÃO PERSONALIZADA")
+            print("\n⚙️  CUSTOM CONFIGURATION")
             print("-" * 70)
             
             # Whisper size
-            print("\nQual tamanho do Whisper?")
-            print("  - tiny   (rápido, menos preciso, ~1s latência)")
-            print("  - small  (padrão, equilibrado, ~2s latência)")
-            print("  - medium (preciso, lento, ~5s latência)")
-            whisper_size = input("Tamanho (tiny/small/medium) [small]: ").strip().lower() or "small"
+            print("\nWhich Whisper size?")
+            print("  - tiny   (fast, less accurate, ~1s latency)")
+            print("  - small  (default, balanced, ~2s latency)")
+            print("  - medium (accurate, slow, ~5s latency)")
+            whisper_size = input("Size (tiny/small/medium) [small]: ").strip().lower() or "small"
             if whisper_size not in ["tiny", "small", "base", "medium"]:
                 whisper_size = "small"
             
             # Chunk duration
-            chunk_input = input("\nDuração do chunk em segundos [2.0]: ").strip()
+            chunk_input = input("\nChunk duration in seconds [2.0]: ").strip()
             try:
                 chunk_duration = float(chunk_input) if chunk_input else 2.0
                 chunk_duration = max(1.0, min(5.0, chunk_duration))  # 1-5s
@@ -99,7 +99,7 @@ def main():
                 chunk_duration = 2.0
             
             # Confidence
-            conf_input = input("\nConfiança mínima para verificação [0.9]: ").strip()
+            conf_input = input("\nMinimum confidence for verification [0.9]: ").strip()
             try:
                 confidence = float(conf_input) if conf_input else 0.9
                 confidence = max(0.5, min(1.0, confidence))  # 0.5-1.0
@@ -107,20 +107,20 @@ def main():
                 confidence = 0.9
             
             # Device
-            print("\nDispositivo (cuda/cpu)?")
-            print("  - cuda (GPU - muito mais rápido)")
-            print("  - cpu  (CPU - mais compatível)")
-            device = input("Dispositivo [cuda]: ").strip().lower() or "cuda"
+            print("\nDevice (cuda/cpu)?")
+            print("  - cuda (GPU - much faster)")
+            print("  - cpu  (CPU - more compatible)")
+            device = input("Device [cuda]: ").strip().lower() or "cuda"
             if device not in ["cuda", "cpu"]:
                 device = "cuda"
             
-            print(f"\n✨ Configuração:")
+            print(f"\n✨ Configuration:")
             print(f"  - Whisper: {whisper_size}")
             print(f"  - Chunk: {chunk_duration}s")
-            print(f"  - Confiança: {confidence:.0%}")
+            print(f"  - Confidence: {confidence:.0%}")
             print(f"  - Device: {device}")
             
-            # Recria transcritor com novas configs
+            # Recreate transcriber with new config
             transcriber = RealtimeTranscriber(
                 verifier,
                 HF_TOKEN,
@@ -130,32 +130,32 @@ def main():
                 chunk_duration=chunk_duration,
             )
         
-        # Inicia gravação
+        # Start recording
         print("\n" + "="*70)
-        print("🎤 PRONTO PARA GRAVAR!")
+        print("🎤 READY TO RECORD!")
         print("="*70)
-        print("\n📣 Instruções:")
-        print("  1. Certifique-se de que o microfone está ligado")
-        print("  2. Fale claramente em português")
-        print("  3. Apresente-se no começo (nome, nome, ...)")
-        print("  4. A transcrição aparecerá em tempo real")
-        print("  5. Pressione Ctrl+C quando terminar")
-        print(f"\n💾 Resultado será salvo em: realtime_sessions/")
+        print("\n📣 Instructions:")
+        print("  1. Make sure your microphone is on")
+        print("  2. Speak clearly")
+        print("  3. Introduce yourself at the beginning (name, name, ...)")
+        print("  4. The transcription will appear in real time")
+        print("  5. Press Ctrl+C when done")
+        print(f"\n💾 Result will be saved to: realtime_sessions/")
+
+        input("\n▶️  Press ENTER to start recording...\n")
         
-        input("\n▶️  Pressione ENTER para iniciar a gravação...\n")
-        
-        # Inicia
+        # Start
         output_file = transcriber.start_recording(embeddings_dir)
-        
-        print(f"\n✅ Sessão salva!")
-        print(f"📄 Ver resultado: {output_file}")
+
+        print(f"\n✅ Session saved!")
+        print(f"📄 View result: {output_file}")
         
     except KeyboardInterrupt:
-        print("\n\n⏹️  Abortado pelo usuário")
+        print("\n\n⏹️  Aborted by user")
         sys.exit(0)
     except Exception as e:
-        print(f"\n❌ ERRO: {e}")
-        logger.exception("Erro fatal")
+        print(f"\n❌ ERROR: {e}")
+        logger.exception("Fatal error")
         sys.exit(1)
 
 
