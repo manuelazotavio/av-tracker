@@ -23,11 +23,12 @@ except ImportError:
     _LIBROSA_AVAILABLE = False
 
 class MultimodalFusion:
-    def __init__(self, hf_token, device="cuda", num_speakers=None, audio_device=None, video_file=None, screen_region=None):
+    def __init__(self, hf_token, device="cuda", num_speakers=None, audio_device=None, video_file=None, screen_region=None, headless=False):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
         self.video_file = video_file  # None → real-time webcam
         self.screen_region = screen_region  # dict for mss screen capture (meeting mode)
         self.num_speakers = num_speakers  # limits tracked faces by area
+        self.headless = headless  # True = no interactive prompts (launched from GUI)
 
         # Person registry shared between audio and video
         _counter = [0]
@@ -166,6 +167,12 @@ class MultimodalFusion:
                 lines.append(f"  {key:30s} avg={sum(vals)/len(vals):6.1f}ms  min={min(vals):5.1f}ms  max={max(vals):5.1f}ms  n={len(vals)}")
             print("\n".join(lines))
 
+        # In file mode, limit to ~5 fps to reduce GPU memory pressure
+        # (video decodes at full speed but detection/embedding is expensive)
+        _target_fps = 5 if self.video_file else 30
+        _frame_interval = 1.0 / _target_fps
+        _last_frame_time = 0.0
+
         while (sct is not None) or (cap is not None and cap.isOpened()):
             if sct:
                 img = np.array(sct.grab(self.screen_region))
@@ -174,6 +181,11 @@ class MultimodalFusion:
                 ret, frame = cap.read()
                 if not ret:
                     break
+                # Skip frames to match target FPS (reduces GPU load)
+                now = time.perf_counter()
+                if now - _last_frame_time < _frame_interval:
+                    continue
+                _last_frame_time = now
 
             _t0_frame = time.perf_counter()
 
@@ -262,8 +274,13 @@ class MultimodalFusion:
             else:
                 display = frame
             cv2.imshow("AV-Tracker Multimodal", display)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # In file mode, wait longer to sync with audio feed (~100ms)
+            wait_ms = 1 if not self.video_file else 100
+            if cv2.waitKey(wait_ms) & 0xFF == ord('q'):
                 break
+            # Periodically free GPU cache to prevent OOM
+            if self.video_file and _vframe_count % 50 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if cap:
             cap.release()
@@ -306,7 +323,8 @@ class MultimodalFusion:
 
         # When closing the video, stop audio and save the session
         self.transcriber.stop()
-        self.transcriber.prompt_and_save_unknown_speakers()
+        if not self.headless:
+            self.transcriber.prompt_and_save_unknown_speakers()
         transcript_file, audio_file = self.transcriber.save_session()
         print(f"\n📝 Transcription saved: {transcript_file}")
         if audio_file:
@@ -342,75 +360,110 @@ def setup_session_logging(log_dir: str = "realtime_sessions") -> str:
     return log_path
 
 
+def _parse_args():
+    """Parse CLI arguments. If none provided, fall back to interactive prompts."""
+    import argparse
+    parser = argparse.ArgumentParser(description="AV-Tracker Multimodal")
+    parser.add_argument("--video", type=str, default=None, help="Path to video file")
+    parser.add_argument("--speakers", type=int, default=None, help="Number of speakers (0=no limit)")
+    parser.add_argument("--audio-device", type=int, default=None, help="Audio input device index")
+    parser.add_argument("--meeting", action="store_true", help="Meeting mode (screen capture)")
+    parser.add_argument("--monitor", type=int, default=1, help="Monitor index for meeting mode")
+    parser.add_argument("--headless", action="store_true", help="No interactive prompts (for GUI launch)")
+    args, _ = parser.parse_known_args()
+    return args
+
+
 if __name__ == "__main__":
     HF_TOKEN = os.environ.get("HF_TOKEN")
     if not HF_TOKEN:
         HF_TOKEN = input("HF_TOKEN not found in environment. Paste your token: ").strip()
 
-    print("\n📌 Mode:")
-    print("  [1] Webcam + Microphone (default)")
-    print("  [2] Video file")
-    print("  [3] Meeting mode (screen capture + system audio)")
-    mode_input = input("Choose mode (1/2/3): ").strip()
+    args = _parse_args()
 
     video_file = None
     screen_region = None
-    audio_device = None
+    audio_device = args.audio_device
+    num_speakers = args.speakers
 
-    if mode_input == "2":
-        while True:
-            video_file_input = input("Path to video file: ").strip()
-            if os.path.isfile(video_file_input):
-                video_file = video_file_input
-                break
-            print(f"❌ File not found: {video_file_input!r} — try again.")
-
-    elif mode_input == "3":
-        # Meeting mode: screen capture + system audio (loopback)
+    # --- CLI mode (arguments provided) ---
+    if args.video:
+        if os.path.isfile(args.video):
+            video_file = args.video
+        else:
+            print(f"File not found: {args.video}")
+            exit(1)
+    elif args.meeting:
         import mss
         sct = mss.mss()
         monitors = sct.monitors
-        print("\n🖥️  Available monitors:")
-        for i, m in enumerate(monitors):
-            if i == 0:
-                print(f"  [0] Full virtual screen ({m['width']}x{m['height']})")
-            else:
-                print(f"  [{i}] Monitor {i} ({m['width']}x{m['height']} at {m['left']},{m['top']})")
-        mon_input = input("Monitor number (Enter for primary): ").strip()
-        mon_idx = int(mon_input) if mon_input.isdigit() else 1
-        screen_region = monitors[min(mon_idx, len(monitors) - 1)]
+        mon_idx = min(args.monitor, len(monitors) - 1)
+        screen_region = monitors[mon_idx]
         sct.close()
-        print(f"  Capturing: {screen_region['width']}x{screen_region['height']}")
+        print(f"Meeting mode: {screen_region['width']}x{screen_region['height']}")
 
-    # Audio device selection (for webcam and meeting modes)
-    if not video_file:
+    # --- Interactive mode (no arguments) ---
+    elif not any([args.video, args.meeting, args.speakers is not None]):
+        print("\n📌 Mode:")
+        print("  [1] Webcam + Microphone (default)")
+        print("  [2] Video file")
+        print("  [3] Meeting mode (screen capture + system audio)")
+        mode_input = input("Choose mode (1/2/3): ").strip()
+
+        if mode_input == "2":
+            while True:
+                video_file_input = input("Path to video file: ").strip()
+                if os.path.isfile(video_file_input):
+                    video_file = video_file_input
+                    break
+                print(f"File not found: {video_file_input!r} — try again.")
+
+        elif mode_input == "3":
+            import mss
+            sct = mss.mss()
+            monitors = sct.monitors
+            print("\n Available monitors:")
+            for i, m in enumerate(monitors):
+                if i == 0:
+                    print(f"  [0] Full virtual screen ({m['width']}x{m['height']})")
+                else:
+                    print(f"  [{i}] Monitor {i} ({m['width']}x{m['height']} at {m['left']},{m['top']})")
+            mon_input = input("Monitor number (Enter for primary): ").strip()
+            mon_idx = int(mon_input) if mon_input.isdigit() else 1
+            screen_region = monitors[min(mon_idx, len(monitors) - 1)]
+            sct.close()
+            print(f"  Capturing: {screen_region['width']}x{screen_region['height']}")
+
+    # Audio device selection (interactive only if not provided via CLI)
+    if not video_file and audio_device is None:
         import sounddevice as _sd
-        print("\n🎤 Available input devices:")
+        print("\n Available input devices:")
         devices = _sd.query_devices()
         input_devices = [(i, d) for i, d in enumerate(devices) if d['max_input_channels'] > 0]
         for i, d in input_devices:
-            # Highlight loopback devices for meeting mode
             hint = ""
             name_lower = d['name'].lower()
             if 'stereo mix' in name_lower or 'mixagem' in name_lower or 'loopback' in name_lower:
-                hint = "  ← SYSTEM AUDIO (recommended for meeting mode)" if screen_region else ""
+                hint = "  <- SYSTEM AUDIO (recommended for meeting mode)" if screen_region else ""
             print(f"  [{i}] {d['name']}{hint}")
         default_idx = _sd.default.device[0]
         print(f"\nCurrent default: [{default_idx}] {devices[default_idx]['name']}")
-        if screen_region:
-            print("💡 For meeting mode, select the Stereo Mix / Mixagem Estereo device.")
         dev_input = input("Input device number (Enter to use default): ").strip()
         audio_device = int(dev_input) if dev_input.isdigit() else None
 
-    num_speakers_input = input("How many people in the meeting? (Enter for no limit): ").strip()
-    num_speakers = None
-    if num_speakers_input.isdigit() and int(num_speakers_input) > 0:
-        num_speakers = int(num_speakers_input)
+    # Speaker count (interactive only if not provided via CLI)
+    if num_speakers is None:
+        num_speakers_input = input("How many people in the meeting? (Enter for no limit): ").strip()
+        if num_speakers_input.isdigit() and int(num_speakers_input) > 0:
+            num_speakers = int(num_speakers_input)
+
+    if num_speakers and num_speakers > 0:
         print(f"Speaker limit: {num_speakers}")
     else:
         print("No speaker limit")
+        num_speakers = None
 
     setup_session_logging()
     app = MultimodalFusion(HF_TOKEN, num_speakers=num_speakers, audio_device=audio_device,
-                           video_file=video_file, screen_region=screen_region)
+                           video_file=video_file, screen_region=screen_region, headless=args.headless)
     app.run()

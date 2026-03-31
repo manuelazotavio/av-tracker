@@ -209,6 +209,16 @@ class RealtimeTranscriber:
         # False-negative tracking
         self._fn_events = []  # list of dicts with FN details
 
+        # Contextual speaker naming: infer names from conversation context
+        self._pending_addressee = None   # {"name": str, "from_speaker": str, "ts": float}
+        self._context_names = set()      # names mentioned in conversation (participant pool)
+        self._addressee_votes = defaultdict(lambda: defaultdict(int))  # speaker_id -> {name: count}
+
+        # LLM-based contextual speaker identification
+        self._llm_analysis_interval = 10  # run LLM analysis every N segments
+        self._llm_last_analysis = 0       # segment count at last analysis
+        self._llm_client = None           # lazy-initialized HF InferenceClient
+
         # Structured metrics for every processed segment (saved as JSON)
         self._segment_metrics = []
         self._session_start = datetime.now()
@@ -369,7 +379,8 @@ class RealtimeTranscriber:
             except queue.Empty:
                 continue
             except Exception as e:
-                logger.error(f"Error in processing: {e}")
+                import traceback
+                logger.error(f"Error in processing: {e}\n{traceback.format_exc()}")
 
     def _process_chunk(self, audio_chunk, chunk_wall_start: float | None = None, new_zone_start_samples: int = 0):
         if not self.running:
@@ -427,43 +438,31 @@ class RealtimeTranscriber:
             distinct_speakers = {spk for _, spk in turns}
 
             # --- SepFormer: when >= 2 speakers detected by diarization ---
-            # Uses source separation to obtain cleaner streams per speaker.
+            # Uses source separation ONLY for speaker identification (verifier).
+            # Transcription always uses original (non-separated) audio to preserve quality.
+            # SepFormer resamples to 8kHz and back, which degrades Whisper accuracy.
+            _sep_spk_to_session = {}
             if len(distinct_speakers) >= 2:
                 _t0_sep = time.perf_counter()
                 separated = self._separate_with_sepformer(audio_np)
                 self._log_perf("sepformer", (time.perf_counter() - _t0_sep) * 1000)
                 if separated is not None:
-                    # Compute session_id per diarization speaker to use as hints
-                    spk_segments = defaultdict(list)
+                    # Compute session_id per diarization speaker for hint matching
+                    _sep_spk_segments = defaultdict(list)
                     for turn, spk in turns:
                         s = int(turn.start * 16000)
                         e = min(int(turn.end * 16000), len(audio_np))
                         seg = audio_np[s:e]
                         if len(seg) >= int(16000 * 0.5):
-                            spk_segments[spk].append(seg)
-                    spk_to_session = {
+                            _sep_spk_segments[spk].append(seg)
+                    _sep_spk_to_session = {
                         spk: self._get_or_create_session_speaker_id(np.concatenate(segs))
-                        for spk, segs in spk_segments.items()
+                        for spk, segs in _sep_spk_segments.items()
                     }
-                    # Associate each separated stream to the session speaker with highest cosine sim
-                    stream_hints = self._match_streams_to_speakers(separated, spk_to_session)
-                    for i, stream in enumerate(separated):
-                        if np.abs(stream).max() < 0.005:
-                            continue  # nearly silent stream (SepFormer artifact)
-                        # Only transcribe the new zone; the first new_zone_start_samples
-                        # served only as separation context for SepFormer.
-                        stream_new = stream[new_zone_start_samples:]
-                        if len(stream_new) < int(16000 * 0.5) or np.abs(stream_new).max() < 0.005:
-                            continue
-                        stream_norm = self._normalize_audio(stream_new)
-                        wall_new_start = chunk_wall_start + new_zone_start_samples / 16000
-                        self._process_segment(
-                            stream_norm,
-                            session_hint=stream_hints.get(i),
-                            wall_time_start=wall_new_start,
-                            wall_time_end=chunk_wall_start + len(stream) / 16000,
-                        )
-                    return  # SepFormer handled it -- skip default processing
+                    # Match separated streams to session speakers (for speaker ID only)
+                    self._match_streams_to_speakers(separated, _sep_spk_to_session)
+                    logger.debug(f"SepFormer: speaker hints computed for {len(distinct_speakers)} speakers")
+                # Fall through to diarization-based processing with ORIGINAL audio
 
             # --- Default diarization-based processing (1 speaker or SepFormer failed) ---
             # Merge consecutive turns from the same speaker into a single segment
@@ -476,10 +475,14 @@ class RealtimeTranscriber:
                 if len(seg) >= int(16000 * 0.5):
                     spk_segments[spk].append(seg)
 
-            spk_to_session = {
-                spk: self._get_or_create_session_speaker_id(np.concatenate(segs))
-                for spk, segs in spk_segments.items()
-            }
+            # Use SepFormer session hints if available, otherwise compute from diarization
+            if _sep_spk_to_session:
+                spk_to_session = _sep_spk_to_session
+            else:
+                spk_to_session = {
+                    spk: self._get_or_create_session_speaker_id(np.concatenate(segs))
+                    for spk, segs in spk_segments.items()
+                }
 
             # Group consecutive new-zone turns by speaker, keeping order
             MIN_SEGMENT_S = 2.0
@@ -714,7 +717,15 @@ class RealtimeTranscriber:
             asd_name = self.speaker_names.get(asd_person_id, asd_person_id) if asd_person_id else "None"
             logger.debug(f"Faces: [{faces_str}] ASD={asd_name}")
 
-            if real_name != "Unknown" and conf >= self.verifier_confidence_min:
+            # Gender sanity check: reject verifier match if audio gender clearly
+            # contradicts the candidate name (e.g., female voice → "Arthur").
+            # This catches contaminated embeddings (wrong person's voice saved under another name).
+            _verifier_name_gender = _gender_of(real_name) if real_name != "Unknown" else None
+            _verifier_gender_ok = not (audio_gender and _verifier_name_gender and audio_gender != _verifier_name_gender)
+            _raw_name_gender = _gender_of(raw_best_name) if raw_best_name and raw_best_name != "Unknown" else None
+            _raw_gender_ok = not (audio_gender and _raw_name_gender and audio_gender != _raw_name_gender)
+
+            if real_name != "Unknown" and conf >= self.verifier_confidence_min and _verifier_gender_ok:
                 # 1) Verifier with high confidence -- most reliable source
                 if real_name not in self._emb_to_pid:
                     pid = self._new_person_id()
@@ -730,8 +741,8 @@ class RealtimeTranscriber:
                         args=(real_name, audio_np.copy()),
                         daemon=True,
                     ).start()
-            elif real_name != "Unknown" and conf >= self.verifier.threshold:
-                # 2) Verifier with moderate confidence (gender already filtered) -- voice
+            elif real_name != "Unknown" and conf >= self.verifier.threshold and _verifier_gender_ok:
+                # 2) Verifier with moderate confidence -- voice
                 #    biometrics is more reliable than ASD (lip pixel diff) especially
                 #    when the speaker is off-camera.
                 if real_name not in self._emb_to_pid:
@@ -741,13 +752,16 @@ class RealtimeTranscriber:
                 speaker_id = self._emb_to_pid[real_name]
                 verified_name = real_name
                 decision = f"VERIFIER_MOD ({conf:.2f})"
-            elif raw_best_name and raw_best_name != "Unknown" and raw_conf >= 0.65:
+            elif raw_best_name and raw_best_name != "Unknown" and raw_conf >= 0.65 and _raw_gender_ok:
                 # 3) Weak verifier -- needs STRONG corroboration (ASD or gender)
                 #    single_face alone is NOT corroboration (just means 1 face visible)
+                #    Gender CONTRADICTION (audio=female, name=male) vetoes ASD corroboration.
+                _name_gender = _gender_of(raw_best_name)
+                _gender_contradicts = audio_gender and _name_gender and audio_gender != _name_gender
                 _corr = []
-                if asd_person_id is not None:
+                if asd_person_id is not None and not _gender_contradicts:
                     _corr.append("ASD")
-                if audio_gender and _gender_of(raw_best_name) == audio_gender:
+                if audio_gender and _name_gender == audio_gender:
                     _corr.append("gender")
                 if _corr:
                     # Strip homonym suffix ("Manuela 2" → "Manuela")
@@ -810,7 +824,25 @@ class RealtimeTranscriber:
 
             # --- Upgrade SESSION decisions: when the audio gender matches
             #     exactly one visible identified face, use it instead of spk_XXX.
-            if decision.startswith(("SESSION_HINT", "SESSION_TRACKER")) and audio_gender and len(visual_people) >= 2:
+            #     Safe when: all speakers are identified, OR there's only 1 identified
+            #     person of that gender (e.g., only 1 woman → all female audio is hers).
+            _all_identified = not self.num_speakers or len(self.identified_speakers) >= self.num_speakers
+            _gender_unique = False
+            if not _all_identified and audio_gender:
+                # Count how many TOTAL speakers could be this gender (identified + context names)
+                _id_same_gender = sum(
+                    1 for pid in self.identified_speakers
+                    if _gender_of(self.speaker_names.get(pid, "")) == audio_gender
+                )
+                _ctx_same_gender = sum(
+                    1 for n in self._context_names
+                    if n not in {self.speaker_names.get(p, "") for p in self.identified_speakers}
+                    and _gender_of(n) == audio_gender
+                )
+                _total_same_gender = _id_same_gender + _ctx_same_gender
+                # Only safe if exactly 1 person of this gender in the entire meeting
+                _gender_unique = _id_same_gender == 1 and _total_same_gender <= 1
+            if (_all_identified or _gender_unique) and decision.startswith(("SESSION_HINT", "SESSION_TRACKER")) and audio_gender and len(visual_people) >= 2:
                 _gf_pid = None
                 _gf_count = 0
                 for vp in visual_people:
@@ -826,7 +858,8 @@ class RealtimeTranscriber:
             # --- Gender cross-check: reject visual decisions (ASD/HINT/SINGLE_FACE)
             #     when the audio gender contradicts the assigned name.
             #     E.g.: male audio assigned to "Manoela" via ASD -> create new speaker.
-            if audio_gender and decision.startswith(("ASD", "FACE_ONLY", "SINGLE_FACE", "SESSION_HINT")):
+            #     Only apply when gender is unambiguous (all identified, or unique gender).
+            if (_all_identified or _gender_unique) and audio_gender and decision.startswith(("ASD", "FACE_ONLY", "SINGLE_FACE", "SESSION_HINT")):
                 assigned_name = verified_name or self.speaker_names.get(speaker_id)
                 # Special case: ASD pointed to a generic face (Person_N)
                 # -> look for 1 non-generic face matching the audio gender for reroute
@@ -957,6 +990,47 @@ class RealtimeTranscriber:
                 self.unknown_speakers_audio[speaker_id].append(audio_np.copy())
 
             self._update_speaker_names_incremental(speaker_id, text, audio_np)
+
+            # Contextual speaker naming: detect names from conversation and apply
+            self._detect_context_names(text, speaker_id)
+            self._apply_context_naming(speaker_id, text)
+
+            # Periodic LLM analysis for remaining unidentified speakers
+            self._maybe_run_llm_analysis()
+
+            # --- Last-speaker deduction: if num_speakers is set and all but one
+            #     are identified, the remaining generic speaker must be the only
+            #     unused name from _context_names or _emb_to_pid.
+            if self.num_speakers and len(self.identified_speakers) == self.num_speakers - 1:
+                # Find all generic speaker_ids that appeared in the session
+                generic_pids = set()
+                for entry in self.full_transcript:
+                    _epid = entry["speaker"]
+                    _ename = self.speaker_names.get(_epid, "")
+                    if self._is_generic_name(_ename):
+                        generic_pids.add(_epid)
+                # Also check active faces
+                for _pid in self.shared_state.get("active_faces", {}).values():
+                    _pname = self.speaker_names.get(_pid, "")
+                    if self._is_generic_name(_pname):
+                        generic_pids.add(_pid)
+                if len(generic_pids) == 1:
+                    _last_pid = generic_pids.pop()
+                    # Collect all known names (identified + context)
+                    _used_names = {
+                        self.speaker_names.get(pid) for pid in self.identified_speakers
+                        if not self._is_generic_name(self.speaker_names.get(pid, ""))
+                    }
+                    _candidate_names = self._context_names - _used_names
+                    if len(_candidate_names) == 1:
+                        _deduced = _candidate_names.pop()
+                        old = self.speaker_names.get(_last_pid)
+                        self.speaker_names[_last_pid] = _deduced
+                        self._emb_to_pid[_deduced] = _last_pid
+                        self.identified_speakers.add(_last_pid)
+                        self._save_live_embedding(_last_pid, _deduced, old_name=old)
+                        logger.info(f"Last-speaker deduction: {_last_pid} -> '{_deduced}' (only remaining name)")
+
             final_name = self.speaker_names.get(speaker_id)
 
             # Camera sync: when the speaker_id is an audio ID (not in active_faces),
@@ -965,9 +1039,9 @@ class RealtimeTranscriber:
             # Only sync if the voice evidence came from VERIFIER (real biometrics),
             # NOT from ASD/SINGLE_FACE/SESSION -- those decisions already depend on the face,
             # so rewriting it from them creates error loops.
-            # Camera sync only at high confidence (VERIFIER_HIGH >= verifier_confidence_min)
-            # VERIFIER_MOD (>=0.55) is too weak to irreversibly rename a face.
-            verifier_decision = decision.startswith("VERIFIER_HIGH")
+            # VERIFIER_HIGH and VERIFIER_MOD both passed the verifier threshold.
+            # VERIFIER_WEAK is too uncertain to irreversibly rename a face.
+            verifier_decision = decision.startswith(("VERIFIER_HIGH", "VERIFIER_MOD"))
             if final_name and not self._is_generic_name(final_name) and verifier_decision:
                 video_pids = set(self.shared_state.get("active_faces", {}).values())
                 if speaker_id not in video_pids:
@@ -992,6 +1066,16 @@ class RealtimeTranscriber:
                             if face_confirmed and not self._is_generic_name(face_confirmed) and face_confirmed != final_name:
                                 logger.debug(f"Camera sync BLOCKED: face confirmed as '{face_confirmed}' != voice '{final_name}'")
                                 cam_target = None  # cancel sync
+                        # Fallback: if ASD pointed to wrong face (or no ASD), find a
+                        # visible generic face matching the audio gender
+                        if cam_target is None and audio_gender:
+                            for _tid, _pid in self.shared_state.get("active_faces", {}).items():
+                                _pname = self.speaker_names.get(_pid, "")
+                                if self._is_generic_name(_pname) and _pid != speaker_id:
+                                    cam_target = _pid
+                                    current_cam = _pname
+                                    logger.debug(f"Camera sync fallback: generic face '{_pname}' ({_pid})")
+                                    break
                         if cam_target is not None and self._is_generic_name(current_cam):
                             self.speaker_names[cam_target] = final_name
                             self._emb_to_pid[final_name] = cam_target
@@ -1169,6 +1253,243 @@ class RealtimeTranscriber:
         """Return True if the name/ID is generic (spk_001, Person_1, Desconhecido_1, Unknown...)."""
         return name is not None and bool(re.match(r'^(spk_\d+|Person_\d+|Desconhecido_\d+|Unknown(_\d+)?)$', name))
 
+    def _detect_context_names(self, text, current_speaker_id):
+        """Detect names from conversational context: vocatives, references, introductions.
+
+        - Vocative (addressing someone): "Arthur, pode falar" → next speaker is Arthur
+        - Invitation: "Fala, Kauan" / "Sua vez, Manu" → next speaker is that name
+        - Thanks/goodbye: "Obrigado, Arthur" → Arthur was the previous or current speaker
+        - Third-person reference: "a parte do Kauan" → Kauan is a participant
+
+        Returns: list of (name, role) where role is "addressee" or "mentioned"
+        """
+        results = []
+        # Words that should never be treated as person names in vocative context
+        _blocklist = getattr(self, '_vocative_blocklist', None)
+        if _blocklist is None:
+            self._vocative_blocklist = {
+                'pessoal', 'gente', 'galera', 'turma', 'cara', 'mano', 'brother',
+                'professor', 'professora', 'doutor', 'doutora',
+                'obrigado', 'obrigada', 'desculpa', 'tchau', 'oi', 'olá',
+                'sim', 'não', 'bom', 'boa', 'tudo', 'certo', 'pronto',
+                'então', 'agora', 'aqui', 'assim', 'tipo', 'enfim',
+                # Common PT-BR words that Whisper capitalizes at sentence start
+                'claro', 'ou', 'mas', 'porque', 'porém', 'pois', 'logo',
+                'talvez', 'nunca', 'sempre', 'ainda', 'também', 'aliás',
+                'legal', 'verdade', 'exato', 'beleza', 'tranquilo', 'show',
+                'viado', 'meu', 'minha', 'nosso', 'nossa', 'dele', 'dela',
+                'isso', 'esse', 'essa', 'aquele', 'aquela', 'qual', 'quem',
+                'onde', 'como', 'quando', 'quanto', 'vamos', 'bora',
+                'hein', 'né', 'pô', 'putz', 'caramba', 'caraca',
+                'maravilha', 'perfeito', 'exatamente', 'simplesmente',
+            }
+            _blocklist = self._vocative_blocklist
+
+        def _valid_name(n):
+            return (n and len(n) >= 2 and n[0].isupper()
+                    and n.lower() not in _blocklist
+                    and not re.match(r'^(Person_\d+|spk_\d+)$', n))
+
+        # 1) Vocative at start: "Arthur, pode falar" / "Kauan, o que acha?"
+        m = re.match(r'^([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)\s*,', text)
+        if m and _valid_name(m.group(1)):
+            results.append((m.group(1).title(), "addressee"))
+
+        # 2) Vocative at end: "Pode falar, Arthur" / "Né, Kauan?"
+        m = re.search(r',\s*([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)\s*[?.!]?\s*$', text)
+        if m and _valid_name(m.group(1)):
+            results.append((m.group(1).title(), "addressee"))
+
+        # 3) Invitation to speak: "Fala, Arthur" / "Vai lá, Manu" / "Pode falar, Kauan"
+        for p in [r'(?:fala|vai|pode falar|sua vez|manda)\s*,?\s*([A-ZÀ-Ú][a-zà-ú]+)',
+                  r'(?:obrigad[oa]|valeu)\s*,?\s*([A-ZÀ-Ú][a-zà-ú]+)']:
+            m = re.search(p, text, re.IGNORECASE)
+            if m:
+                raw = m.group(1)
+                if raw[0].isupper() and _valid_name(raw):
+                    results.append((raw.title(), "addressee"))
+
+        # 4) Third-person references: "a parte do Kauan" / "como o Arthur disse"
+        for p in [r'(?:d[oa]|com o|com a|que o|que a)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)',
+                  r'(?:parte|vez|turno|projeto|trabalho)\s+d[oa]\s+([A-ZÀ-Ú][a-zà-ú]+)']:
+            for mm in re.finditer(p, text):
+                raw = mm.group(1)
+                if _valid_name(raw):
+                    results.append((raw.title(), "mentioned"))
+
+        # 5) NER fallback: extract any PER entity not already found
+        ner_names = self._extract_names_with_ner(text)
+        found_names = {r[0].lower() for r in results}
+        for n in ner_names:
+            if n.lower() not in found_names and _valid_name(n):
+                results.append((n.title(), "mentioned"))
+
+        # Register all found names in context pool
+        for name, role in results:
+            self._context_names.add(name)
+
+        # If addressee found, set pending for next speaker
+        for name, role in results:
+            if role == "addressee":
+                self._pending_addressee = {
+                    "name": name,
+                    "from_speaker": current_speaker_id,
+                    "ts": time.time(),
+                }
+                logger.debug(f"Context: addressee detected '{name}' (from {current_speaker_id})")
+                break  # only one addressee per segment
+
+        return results
+
+    def _apply_context_naming(self, speaker_id, text):
+        """Try to name an unidentified speaker using contextual evidence.
+        Called after _update_speaker_names_incremental (which handles self-introductions).
+        """
+        current_name = self.speaker_names.get(speaker_id)
+        if current_name and not self._is_generic_name(current_name):
+            return  # already has a real name
+
+        # 1) Check pending addressee from previous turn
+        pa = self._pending_addressee
+        if pa and pa["from_speaker"] != speaker_id and (time.time() - pa["ts"]) < 30:
+            name = pa["name"]
+            # Don't assign if this name is already taken by another speaker
+            if name not in self._emb_to_pid or self._emb_to_pid[name] == speaker_id:
+                self._addressee_votes[speaker_id][name] += 2  # strong signal
+                logger.debug(f"Context: +2 vote '{name}' for {speaker_id} (addressee)")
+
+        # 2) Check accumulated votes — assign if confident (>= 3 votes)
+        votes = self._addressee_votes.get(speaker_id, {})
+        if votes:
+            best_name = max(votes, key=votes.get)
+            best_count = votes[best_name]
+            if best_count >= 3:
+                # Verify name isn't taken
+                if best_name not in self._emb_to_pid or self._emb_to_pid[best_name] == speaker_id:
+                    speakers_full = self.num_speakers and len(self.identified_speakers) >= self.num_speakers
+                    if not speakers_full:
+                        old_name = current_name
+                        self.speaker_names[speaker_id] = best_name
+                        self._emb_to_pid[best_name] = speaker_id
+                        self.identified_speakers.add(speaker_id)
+                        self._save_live_embedding(speaker_id, best_name, old_name=old_name)
+                        logger.info(f"Context naming: {speaker_id} -> '{best_name}' ({best_count} votes)")
+                        # Clear votes after assignment
+                        self._addressee_votes.pop(speaker_id, None)
+
+        # Clear expired pending addressee
+        if pa and (time.time() - pa["ts"]) > 30:
+            self._pending_addressee = None
+
+    def _llm_identify_speakers(self):
+        """Use an LLM to analyze the full transcript and identify unnamed speakers.
+
+        Runs in a background thread every _llm_analysis_interval segments.
+        Sends the accumulated transcript to an LLM, which returns a JSON mapping
+        of generic IDs (spk_016, Person_1) to real names inferred from context.
+        """
+        if not self.use_ai_analysis:
+            return
+        # Build transcript
+        generic_speakers = set()
+        lines = []
+        for entry in self.full_transcript[-50:]:  # last 50 entries max (context window)
+            name = entry.get('verified_name') or entry['speaker']
+            lines.append(f"[{name}]: {entry['text']}")
+            if self._is_generic_name(name):
+                generic_speakers.add(name)
+
+        if not generic_speakers or not lines:
+            return  # nothing to identify
+
+        already_identified = {
+            pid: name for pid, name in self.speaker_names.items()
+            if not self._is_generic_name(name)
+        }
+        context_names = self._context_names - set(already_identified.values())
+
+        transcript_text = "\n".join(lines[-40:])  # trim to last 40 lines
+        num_spk = self.num_speakers or "desconhecido"
+
+        prompt = (
+            f"Analise esta transcrição de uma reunião com {num_spk} participantes.\n"
+            f"Alguns falantes já foram identificados: {dict(list(already_identified.items())[:8])}\n"
+            f"Nomes mencionados na conversa: {', '.join(context_names) if context_names else 'nenhum'}\n"
+            f"Falantes genéricos (não identificados): {', '.join(sorted(generic_speakers))}\n\n"
+            f"Transcrição:\n{transcript_text}\n\n"
+            f"Baseado no contexto da conversa (quem fala com quem, referências a outros, "
+            f"tópicos discutidos, gênero gramatical), identifique o nome real de cada "
+            f"falante genérico.\n\n"
+            f"Responda APENAS com um JSON mapeando IDs genéricos para nomes reais. "
+            f"Exemplo: {{\"spk_016\": \"Arthur\", \"Person_1\": \"Kauan\"}}\n"
+            f"Só inclua mapeamentos que você tem CERTEZA. Se não tem certeza, omita."
+        )
+
+        try:
+            if self._llm_client is None:
+                from huggingface_hub import InferenceClient
+                self._llm_client = InferenceClient(token=HF_TOKEN)
+
+            response = self._llm_client.text_generation(
+                prompt,
+                model="mistralai/Mistral-7B-Instruct-v0.3",
+                max_new_tokens=150,
+                temperature=0.1,
+            )
+
+            # Extract JSON from response
+            json_match = re.search(r'\{[^}]+\}', response)
+            if json_match:
+                import json
+                mapping = json.loads(json_match.group())
+                logger.info(f"LLM speaker mapping: {mapping}")
+
+                for generic_id, real_name in mapping.items():
+                    if not isinstance(real_name, str) or len(real_name) < 2:
+                        continue
+                    real_name = real_name.strip().title()
+                    # Find the speaker_id for this generic label
+                    target_pid = None
+                    for pid, name in self.speaker_names.items():
+                        if name == generic_id or pid == generic_id:
+                            target_pid = pid
+                            break
+                    if target_pid is None:
+                        continue
+                    # Don't overwrite existing real names
+                    current = self.speaker_names.get(target_pid)
+                    if current and not self._is_generic_name(current):
+                        continue
+                    # Don't assign if name is already taken
+                    if real_name in self._emb_to_pid and self._emb_to_pid[real_name] != target_pid:
+                        continue
+
+                    speakers_full = self.num_speakers and len(self.identified_speakers) >= self.num_speakers
+                    if not speakers_full:
+                        old_name = current
+                        self.speaker_names[target_pid] = real_name
+                        self._emb_to_pid[real_name] = target_pid
+                        self.identified_speakers.add(target_pid)
+                        self._save_live_embedding(target_pid, real_name, old_name=old_name)
+                        logger.info(f"LLM naming: {target_pid} ({generic_id}) -> '{real_name}'")
+            else:
+                logger.debug(f"LLM response (no JSON found): {response[:200]}")
+        except Exception as e:
+            logger.warning(f"LLM speaker analysis failed: {e}")
+
+    def _maybe_run_llm_analysis(self):
+        """Trigger LLM analysis every N segments, in a background thread."""
+        seg_count = len(self._segment_metrics)
+        if seg_count - self._llm_last_analysis >= self._llm_analysis_interval:
+            self._llm_last_analysis = seg_count
+            # Check if there are any generic speakers worth analyzing
+            has_generic = any(
+                self._is_generic_name(self.speaker_names.get(pid, ""))
+                for pid in set(e["speaker"] for e in self.full_transcript[-20:])
+            )
+            if has_generic:
+                threading.Thread(target=self._llm_identify_speakers, daemon=True).start()
+
     def _extract_names_with_ner(self, text):
         """Extract person names from text using spaCy NER. Strips Portuguese honorific prefixes."""
         if not self.nlp: return []
@@ -1254,6 +1575,12 @@ class RealtimeTranscriber:
             'cristão', 'cristã', 'ateu', 'ateia', 'católico', 'católica',
             'tímido', 'tímida', 'ansioso', 'ansiosa', 'feliz', 'triste',
             'novo', 'nova', 'velho', 'velha', 'gordo', 'gorda', 'magro', 'magra',
+            # Common words Whisper capitalizes / NER misidentifies
+            'claro', 'ou', 'mas', 'porque', 'porém', 'pois', 'logo',
+            'talvez', 'nunca', 'sempre', 'ainda', 'também', 'aliás',
+            'legal', 'verdade', 'exato', 'beleza', 'tranquilo', 'show',
+            'viado', 'meu', 'minha', 'nosso', 'nossa', 'simplesmente',
+            'maravilha', 'perfeito', 'exatamente', 'piloto', 'obrigado',
         }
         patterns = [r'(?:meu nome é|me chamo|eu sou|sou o|sou a)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)', r'(?:aqui é|aqui quem fala é)\s+(?:o|a)?\s*([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)']
         for p in patterns:
@@ -1355,6 +1682,14 @@ class RealtimeTranscriber:
             np.save(os.path.join(emb_dir, filename), embedding)
             logger.info(f"New voice biometric saved for {name}.")
             self.verifier.load_embeddings(emb_dir)
+            # Sync to database
+            try:
+                from src.database import get_db
+                db = get_db()
+                spk_id = db.add_speaker(name)
+                db.save_voice_embedding(spk_id, embedding, source_file=filename)
+            except Exception as db_err:
+                logger.warning(f"DB sync failed for voice embedding: {db_err}")
         except Exception as e:
             logger.error(f"Error saving voice biometric: {e}")
 
@@ -1414,7 +1749,7 @@ class RealtimeTranscriber:
                 print(f"(playback error: {e})")
 
             while True:
-                name = input(f"\n  Name for this speaker (Enter=skip, r=replay audio): ").strip()
+                name = input(f"\n  Name for this speaker (Enter=skip, r=replay, 'mixed'=multiple speakers): ").strip()
                 if name.lower() == 'r':
                     print(f"  Replaying {len(preview)/self.sample_rate:.1f}s clip... ", end="", flush=True)
                     try:
@@ -1438,6 +1773,9 @@ class RealtimeTranscriber:
                 break
             if not name:
                 print("  Skipped.\n")
+                continue
+            if name.lower() == 'mixed':
+                print("  Marked as mixed audio (multiple speakers). No embedding saved.\n")
                 continue
 
             self._save_live_embedding(spk_id, name, old_name=generic_name)
@@ -1574,6 +1912,34 @@ class RealtimeTranscriber:
                 wf.setframerate(self.sample_rate)
                 wf.writeframes(pcm16.tobytes())
             logger.info(f"Audio saved: {audio_file}")
+
+        # --- Save to SQLite database ---
+        try:
+            from src.database import get_db
+            db = get_db()
+
+            # Read full transcript text
+            transcript_text = None
+            if os.path.exists(transcript_file):
+                with open(transcript_file, encoding="utf-8") as f:
+                    transcript_text = f.read()
+
+            session_pk = db.save_session(
+                session_id=ts,
+                started_at=self._session_start.isoformat(),
+                config=metrics_payload.get("config") if self._segment_metrics else None,
+                summary=metrics_payload.get("summary") if self._segment_metrics else None,
+                transcript=transcript_text,
+                audio_file=audio_file,
+            )
+
+            if self._segment_metrics:
+                db.save_segments(session_pk, self._segment_metrics)
+
+            logger.info(f"Session saved to database (pk={session_pk})")
+        except Exception as e:
+            logger.warning(f"Failed to save session to database: {e}")
+
         return transcript_file, audio_file
 
     def feed_audio_chunk(self, audio_data: np.ndarray):

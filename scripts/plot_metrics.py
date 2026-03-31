@@ -307,16 +307,31 @@ def plot_compare_sessions(paths: list[str], out_dir: str | None = None):
     fig, axes = plt.subplots(n_rows, 2, figsize=(15, 5 * n_rows))
     fig.suptitle(f"Session Comparison ({len(sessions)} sessions)", fontsize=13, fontweight="bold")
 
-    # 1) Identification rate & FN rate across sessions
+    # Load validation data if available
+    val_data = {}
+    for s in sessions:
+        sid = s["session_id"]
+        val_path = os.path.join("realtime_sessions", f"validation_{sid}.json")
+        if os.path.exists(val_path):
+            with open(val_path, encoding="utf-8") as f:
+                val_data[sid] = json.load(f)
+
+    # 1) Identification rate, FN rate & validated accuracy
     ax = axes[0, 0]
     id_rates = [s["summary"]["identification_rate"] for s in sessions]
     fn_rates = [s["summary"]["fn_rate"] for s in sessions]
     x = np.arange(len(labels))
     fp_rates = [s["summary"].get("fp_rate", 0) for s in sessions]
-    bw = 0.25
-    ax.bar(x - bw, id_rates, bw, color="#2ecc71", label="Voice ID rate")
-    ax.bar(x, fn_rates, bw, color="#e74c3c", label="Voice FN rate")
-    ax.bar(x + bw, fp_rates, bw, color="#e67e22", label="FP risk rate")
+    bw = 0.2
+    ax.bar(x - 1.5*bw, id_rates, bw, color="#2ecc71", label="Voice ID rate")
+    ax.bar(x - 0.5*bw, fn_rates, bw, color="#e74c3c", label="Voice FN rate")
+    ax.bar(x + 0.5*bw, fp_rates, bw, color="#e67e22", label="FP risk rate")
+    # Overlay validated accuracy as line if available
+    val_acc = [val_data.get(s["session_id"], {}).get("accuracy") for s in sessions]
+    if any(v is not None for v in val_acc):
+        _vx = [i for i, v in enumerate(val_acc) if v is not None]
+        _vy = [val_acc[i] for i in _vx]
+        ax.plot(_vx, _vy, "D-", color="#8e44ad", lw=2, ms=8, label="Validated accuracy")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))

@@ -229,6 +229,14 @@ class PersonIDTracker:
             if hasattr(self, '_emb_files'):
                 self._emb_files[name] = filename
             print(f"[PersonIDTracker] Auto-enrolled: {name} (track {int(track_id)})")
+            # Sync to database
+            try:
+                from src.database import get_db
+                db = get_db()
+                spk_id = db.add_speaker(name)
+                db.save_face_embedding(spk_id, avg_emb, source_file=filename)
+            except Exception as e:
+                logger.debug(f"DB sync failed for face embedding: {e}")
 
         self._face_events.append({
             "ts": time.time(), "event": "enroll",
@@ -295,6 +303,21 @@ class PersonIDTracker:
                             os.remove(os.path.join(self.emb_dir, old_f))
                         except OSError:
                             pass
+        # Cleanup orphan Person_N files: if no track uses the old generic name anymore,
+        # delete the file from disk to prevent accumulation across sessions.
+        if self.emb_dir and old_name and re.match(r'^Person_\d+$', old_name):
+            still_used = any(tname == old_name for tname in self._track_to_name.values())
+            if not still_used:
+                for _f in list(os.listdir(self.emb_dir)):
+                    _base = os.path.splitext(_f)[0]
+                    if _base == old_name or _base.startswith(old_name + "_"):
+                        try:
+                            os.remove(os.path.join(self.emb_dir, _f))
+                            logger.debug(f"👤 Cleaned orphan file: {_f}")
+                        except OSError:
+                            pass
+                self.known_embeddings.pop(old_name, None)
+
         # Log face FN: voice identified the person but face tracker didn't recognise them
         _is_generic = bool(re.match(r'^(Person_\d+|Unknown)$', old_name or ""))
         _is_real_new = not bool(re.match(r'^(Person_\d+|Unknown)$', new_name or ""))
@@ -426,25 +449,50 @@ class PersonIDTracker:
 
                         # Not yet confirmed — accumulate votes before promoting
                         if best_name != "Unknown":
-                            buf = self._name_confirm.get(track_id)
-                            if buf and buf["name"] == best_name:
-                                buf["count"] += 1
-                            else:
-                                self._name_confirm[track_id] = {"name": best_name, "count": 1}
-                                buf = self._name_confirm[track_id]
+                            # Block if another track is already pending with the SAME
+                            # real name AND has a higher average score — only the best
+                            # face should claim a unique identity.
+                            _dominated = False
+                            if not _generic_re.match(best_name):
+                                for _ot, _ob in self._name_confirm.items():
+                                    if _ot != track_id and _ob["name"] == best_name:
+                                        _ot_avg = _ob.get("avg_score", 0)
+                                        if _ot_avg > best_score:
+                                            _dominated = True
+                                            logger.debug(f"👤 Pending BLOCKED track={int(track_id)}: "
+                                                         f"'{best_name}' (score={best_score:.2f} < track {int(_ot)} avg={_ot_avg:.2f})")
+                                            break
 
-                            if buf["count"] >= self.CONFIRM_FRAMES:
-                                # Confirmed: promote to _track_to_name
-                                claimed_this_frame[best_name] = track_id
-                                self._track_to_name[track_id] = best_name
-                                self._track_buffer.pop(track_id, None)
-                                self._persist_fail_count.pop(track_id, None)
-                                self._name_confirm.pop(track_id, None)
-                                logger.debug(f"👤 Confirmed track={int(track_id)}: '{best_name}' ({self.CONFIRM_FRAMES} frames)")
-                            else:
-                                # Still awaiting confirmation — return Unknown for now
-                                logger.debug(f"👤 Pending track={int(track_id)}: '{best_name}' ({buf['count']}/{self.CONFIRM_FRAMES})")
+                            if _dominated:
                                 best_name, best_score = "Unknown", 0.0
+                            else:
+                                buf = self._name_confirm.get(track_id)
+                                if buf and buf["name"] == best_name:
+                                    buf["count"] += 1
+                                    # Running average score for contention resolution
+                                    buf["avg_score"] = (buf["avg_score"] * (buf["count"] - 1) + best_score) / buf["count"]
+                                else:
+                                    self._name_confirm[track_id] = {"name": best_name, "count": 1, "avg_score": best_score}
+                                    buf = self._name_confirm[track_id]
+
+                                if buf["count"] >= self.CONFIRM_FRAMES:
+                                    # Before confirming, evict any other track pending
+                                    # with the same name (they lost the race)
+                                    for _ot in list(self._name_confirm):
+                                        if _ot != track_id and self._name_confirm[_ot]["name"] == best_name:
+                                            logger.debug(f"👤 Evicted track={int(_ot)}: lost '{best_name}' to track={int(track_id)}")
+                                            del self._name_confirm[_ot]
+                                    # Confirmed: promote to _track_to_name
+                                    claimed_this_frame[best_name] = track_id
+                                    self._track_to_name[track_id] = best_name
+                                    self._track_buffer.pop(track_id, None)
+                                    self._persist_fail_count.pop(track_id, None)
+                                    self._name_confirm.pop(track_id, None)
+                                    logger.debug(f"👤 Confirmed track={int(track_id)}: '{best_name}' ({self.CONFIRM_FRAMES} frames)")
+                                else:
+                                    # Still awaiting confirmation — return Unknown for now
+                                    logger.debug(f"👤 Pending track={int(track_id)}: '{best_name}' ({buf['count']}/{self.CONFIRM_FRAMES})")
+                                    best_name, best_score = "Unknown", 0.0
 
             if best_name == "Unknown" and track_id in self._track_to_name:
                 prev_name = self._track_to_name[track_id]
