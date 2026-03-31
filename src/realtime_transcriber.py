@@ -36,7 +36,7 @@ snapshot_download = None
 spacy_nlp = None
 hf_pipeline_func = None
 
-HF_TOKEN = "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"
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)

@@ -7,6 +7,9 @@ import threading
 import torch
 import numpy as np
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env file (HF_TOKEN, etc.)
 from src.realtime_transcriber import RealtimeTranscriber
 from src.multi_speaker_verifier import MultiSpeakerVerifier
 from src.yolo_detector import YOLOFaceDetector
@@ -340,7 +343,9 @@ def setup_session_logging(log_dir: str = "realtime_sessions") -> str:
 
 
 if __name__ == "__main__":
-    HF_TOKEN = "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"
+    HF_TOKEN = os.environ.get("HF_TOKEN")
+    if not HF_TOKEN:
+        HF_TOKEN = input("HF_TOKEN not found in environment. Paste your token: ").strip()
 
     print("\n📌 Mode:")
     print("  [1] Webcam + Microphone (default)")
