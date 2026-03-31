@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import logging
 import cv2
@@ -24,10 +25,10 @@ class _EdgeFaceXXS(nn.Module):
 
 
 class PersonIDTracker:
-    MATCH_THRESHOLD = 0.65  # cosine similarity to consider a known person
-    MERGE_THRESHOLD = 0.50  # threshold for merging during auto-enrollment
+    MATCH_THRESHOLD = 0.55  # cosine similarity to consider a known person
+    MERGE_THRESHOLD = 0.60  # threshold for merging during auto-enrollment (must be > MATCH)
     ENROLL_FRAMES = 50      # frames to accumulate (~5s) for more stable average embedding
-    CONFIRM_FRAMES = 6      # consecutive frames needed to confirm a known-name assignment
+    CONFIRM_FRAMES = 10     # consecutive frames needed to confirm a known-name assignment
 
     def __init__(self, model_path="od_model/edgeface_xxs.pt", device="cuda"):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
@@ -51,6 +52,11 @@ class PersonIDTracker:
         self._perf_frame_count = 0
         self._perf_summary_interval = 100  # prints summary every N frames
 
+        # --- Session metrics ---
+        self._face_events = []           # structured events for post-session analysis
+        self._match_scores_sample = []   # sampled (track_id, best_name, best_score, all_scores)
+        self._sample_counter = 0
+
     def load_known_embeddings(self, emb_dir):
         self.emb_dir = emb_dir
         if not os.path.exists(emb_dir):
@@ -61,14 +67,13 @@ class PersonIDTracker:
             if file.endswith(".npy"):
                 base = file[:-4]  # remove .npy
                 if base.endswith("_auto"):
-                    name = base[:-5]  # "Person_1_auto" -> "Person_1"
+                    base = base[:-5]  # strip _auto suffix first
+                # Strip timestamp (YYYYMMDD_HHMMSS) if present
+                parts = base.split('_')
+                if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
+                    name = '_'.join(parts[:-2])
                 else:
-                    # timestamp format: Name_YYYYMMDD_HHMMSS
-                    parts = base.split('_')
-                    if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
-                        name = '_'.join(parts[:-2])
-                    else:
-                        name = parts[0]
+                    name = base
                 emb = np.load(os.path.join(emb_dir, file))
                 _raw_face_embs.setdefault(name, []).append(emb)
                 self._emb_files[name] = file
@@ -89,7 +94,13 @@ class PersonIDTracker:
                     pass
 
     def _consolidate_embeddings(self):
-        """Merge known embeddings that are too similar (same person enrolled multiple times)."""
+        """Merge known embeddings that are too similar (same person enrolled multiple times).
+
+        Safety: only merges when at least one side is a generic name (Person_N).
+        Two real names (e.g. Manuela, Heitor) are NEVER merged, even if their
+        embeddings are similar — the model may simply not be discriminative enough.
+        """
+        _generic_re = re.compile(r'^Person_\d+$')
         names = list(self.known_embeddings.keys())
         merged_into = {}  # name -> canonical name it was merged into
 
@@ -99,16 +110,28 @@ class PersonIDTracker:
             for name_b in names[i + 1:]:
                 if name_b in merged_into:
                     continue
+                # Never merge two real (non-generic) names
+                a_is_generic = bool(_generic_re.match(name_a))
+                b_is_generic = bool(_generic_re.match(name_b))
+                if not a_is_generic and not b_is_generic:
+                    continue
                 emb_a = self.known_embeddings[name_a]
                 emb_b = self.known_embeddings[name_b]
                 sim = float(np.dot(emb_a, emb_b))
                 if sim >= self.MERGE_THRESHOLD:
-                    # Average and re-normalise
-                    avg = (emb_a + emb_b) / 2
+                    # Prefer keeping the real name as canonical
+                    if b_is_generic and not a_is_generic:
+                        canon, dup = name_a, name_b
+                    elif a_is_generic and not b_is_generic:
+                        canon, dup = name_b, name_a
+                    else:
+                        canon, dup = name_a, name_b  # both generic
+                    avg = (self.known_embeddings[canon] + self.known_embeddings[dup]) / 2
                     avg = avg / (np.linalg.norm(avg) + 1e-8)
-                    self.known_embeddings[name_a] = avg
-                    merged_into[name_b] = name_a
-                    print(f"[PersonIDTracker] Consolidated '{name_b}' -> '{name_a}' (sim={sim:.3f})")
+                    self.known_embeddings[canon] = avg
+                    merged_into[dup] = canon
+                    logger.info(f"Consolidated '{dup}' -> '{canon}' (sim={sim:.3f})")
+                    print(f"[PersonIDTracker] Consolidated '{dup}' -> '{canon}' (sim={sim:.3f})")
                     # Remove duplicate file and update canonical file on disk
                     if self.emb_dir:
                         dup_file = self._emb_files.get(name_b)
@@ -152,6 +175,17 @@ class PersonIDTracker:
             top_str = " | ".join(f"{n}: {s:.2f}" for n, s in scores[:3])
             tid_str = f"track={track_id}" if track_id is not None else ""
             logger.debug(f"👤 FaceMatch {tid_str}: [{top_str}] thr={self.MATCH_THRESHOLD}")
+        # Sample match scores for session metrics (every 30 frames per track)
+        self._sample_counter += 1
+        if self._sample_counter % 30 == 0 and scores:
+            self._match_scores_sample.append({
+                "ts": time.time(),
+                "track_id": int(track_id) if track_id is not None else -1,
+                "best_name": best_name,
+                "best_score": round(best_score, 4),
+                "top3": [(n, round(s, 4)) for n, s in scores[:3]],
+                "matched": best_score >= self.MATCH_THRESHOLD,
+            })
         if best_score < self.MATCH_THRESHOLD:
             return "Unknown", best_score
         return best_name, best_score
@@ -196,6 +230,11 @@ class PersonIDTracker:
                 self._emb_files[name] = filename
             print(f"[PersonIDTracker] Auto-enrolled: {name} (track {int(track_id)})")
 
+        self._face_events.append({
+            "ts": time.time(), "event": "enroll",
+            "track_id": int(track_id), "name": name,
+            "merge_target": merge_name, "merge_score": round(merge_score, 4),
+        })
         return name
 
     def rename_person(self, old_name, new_name, only_track_id=None):
@@ -230,18 +269,41 @@ class PersonIDTracker:
             for track_id, tname in self._track_to_name.items():
                 if tname == old_name:
                     self._track_to_name[track_id] = new_name
-        # Renames file on disk
+        # Renames file on disk — uses timestamped names to accumulate
+        # embeddings from different sessions/conditions (diversity improves
+        # cross-session matching with small face models like EdgeFace XXS).
         if self.emb_dir:
+            from datetime import datetime as _dt
             old_file = self._emb_files.pop(old_name, None)
             if old_file:
                 old_path = os.path.join(self.emb_dir, old_file)
-                new_file = f"{new_name}_auto.npy"
+                ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+                new_file = f"{new_name}_{ts}_auto.npy"
                 new_path = os.path.join(self.emb_dir, new_file)
                 if os.path.exists(old_path):
-                    if os.path.exists(new_path):
-                        os.remove(new_path)
                     os.rename(old_path, new_path)
                 self._emb_files[new_name] = new_file
+                # Limit total files per person to prevent bloat (keep newest)
+                MAX_FACE_FILES = 8
+                all_files = sorted(
+                    [f for f in os.listdir(self.emb_dir)
+                     if f.endswith(".npy") and f.startswith(new_name)],
+                )
+                if len(all_files) > MAX_FACE_FILES:
+                    for old_f in all_files[:len(all_files) - MAX_FACE_FILES]:
+                        try:
+                            os.remove(os.path.join(self.emb_dir, old_f))
+                        except OSError:
+                            pass
+        # Log face FN: voice identified the person but face tracker didn't recognise them
+        _is_generic = bool(re.match(r'^(Person_\d+|Unknown)$', old_name or ""))
+        _is_real_new = not bool(re.match(r'^(Person_\d+|Unknown)$', new_name or ""))
+        if _is_generic and _is_real_new:
+            self._face_events.append({
+                "ts": time.time(), "event": "face_fn_rename",
+                "old_name": old_name, "new_name": new_name,
+                "track_id": int(only_track_id) if only_track_id is not None else None,
+            })
         print(f"[PersonIDTracker] Renamed '{old_name}' -> '{new_name}'")
         # Re-consolidate after rename to merge duplicates created in the session
         self._consolidate_embeddings()
@@ -435,3 +497,47 @@ class PersonIDTracker:
         if self._perf_frame_count % self._perf_summary_interval == 0:
             self._print_perf_summary()
         return results
+
+    # --- Session metrics API ---
+
+    def get_session_face_metrics(self):
+        """Return structured face recognition metrics for the session."""
+        _generic_re = re.compile(r'^(Person_\d+|Unknown)$')
+
+        enrollments = [e for e in self._face_events if e["event"] == "enroll"]
+        face_fns = [e for e in self._face_events if e["event"] == "face_fn_rename"]
+
+        # Unique tracks that got a real name vs remained generic
+        final_names = dict(self._track_to_name)
+        real_names = {tid: n for tid, n in final_names.items() if not _generic_re.match(n)}
+        generic_names = {tid: n for tid, n in final_names.items() if _generic_re.match(n)}
+
+        # Match score stats (from sampled scores)
+        all_scores = [s["best_score"] for s in self._match_scores_sample]
+        matched_scores = [s["best_score"] for s in self._match_scores_sample if s["matched"]]
+        unmatched_scores = [s["best_score"] for s in self._match_scores_sample if not s["matched"]]
+
+        return {
+            "total_tracks": len(final_names),
+            "tracks_identified": len(real_names),
+            "tracks_generic": len(generic_names),
+            "face_fn_count": len(face_fns),
+            "face_fn_events": face_fns,
+            "enrollments": len(enrollments),
+            "match_threshold": self.MATCH_THRESHOLD,
+            "merge_threshold": self.MERGE_THRESHOLD,
+            "known_embeddings_count": len(self.known_embeddings),
+            "total_frames": self._perf_frame_count,
+            "match_score_stats": {
+                "n_samples": len(all_scores),
+                "mean": round(float(np.mean(all_scores)), 4) if all_scores else 0,
+                "median": round(float(np.median(all_scores)), 4) if all_scores else 0,
+                "max": round(float(max(all_scores)), 4) if all_scores else 0,
+                "min": round(float(min(all_scores)), 4) if all_scores else 0,
+                "pct_matched": round(len(matched_scores) / len(all_scores), 4) if all_scores else 0,
+                "mean_matched": round(float(np.mean(matched_scores)), 4) if matched_scores else 0,
+                "mean_unmatched": round(float(np.mean(unmatched_scores)), 4) if unmatched_scores else 0,
+            },
+            "match_scores_sample": self._match_scores_sample,
+            "events": self._face_events,
+        }

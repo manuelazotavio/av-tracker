@@ -20,9 +20,10 @@ except ImportError:
     _LIBROSA_AVAILABLE = False
 
 class MultimodalFusion:
-    def __init__(self, hf_token, device="cuda", num_speakers=None, audio_device=None, video_file=None):
+    def __init__(self, hf_token, device="cuda", num_speakers=None, audio_device=None, video_file=None, screen_region=None):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
         self.video_file = video_file  # None → real-time webcam
+        self.screen_region = screen_region  # dict for mss screen capture (meeting mode)
         self.num_speakers = num_speakers  # limits tracked faces by area
 
         # Person registry shared between audio and video
@@ -129,12 +130,18 @@ class MultimodalFusion:
             time.sleep(0.1)  # simulate real-time
 
     def video_loop(self):
-        cap = cv2.VideoCapture(self.video_file if self.video_file else 0)
-
-        if not cap.isOpened():
-            src = f"file '{self.video_file}'" if self.video_file else "webcam"
-            print(f"❌ Error: Could not open {src}.")
-            return
+        # Screen capture mode (meeting mode) — uses mss instead of cv2.VideoCapture
+        sct = None
+        cap = None
+        if self.screen_region:
+            import mss
+            sct = mss.mss()
+        else:
+            cap = cv2.VideoCapture(self.video_file if self.video_file else 0)
+            if not cap.isOpened():
+                src = f"file '{self.video_file}'" if self.video_file else "webcam"
+                print(f"❌ Error: Could not open {src}.")
+                return
 
         person_names = self.shared_state["person_names"]
         emb_to_person = self.shared_state["embedding_to_person"]
@@ -156,10 +163,14 @@ class MultimodalFusion:
                 lines.append(f"  {key:30s} avg={sum(vals)/len(vals):6.1f}ms  min={min(vals):5.1f}ms  max={max(vals):5.1f}ms  n={len(vals)}")
             print("\n".join(lines))
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+        while (sct is not None) or (cap is not None and cap.isOpened()):
+            if sct:
+                img = np.array(sct.grab(self.screen_region))
+                frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
             _t0_frame = time.perf_counter()
 
@@ -251,7 +262,10 @@ class MultimodalFusion:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        cap.release()
+        if cap:
+            cap.release()
+        if sct:
+            sct.close()
         cv2.destroyAllWindows()
 
     def run(self):
@@ -265,6 +279,17 @@ class MultimodalFusion:
             print("\n" + "="*60)
             print("🎬 VIDEO FILE MODE")
             print(f"File: {self.video_file}")
+            print("="*60 + "\n")
+        elif self.screen_region:
+            # Meeting mode: screen capture + system audio
+            audio_thread = threading.Thread(target=self.transcriber.start_recording, daemon=True)
+            audio_thread.start()
+            r = self.screen_region
+            print("\n" + "="*60)
+            print("🖥️  MEETING MODE")
+            print(f"Screen region: {r['width']}x{r['height']} at ({r['left']},{r['top']})")
+            print("Audio: system loopback (select Mixagem Estereo / Stereo Mix)")
+            print("Press 'q' on the preview window to stop.")
             print("="*60 + "\n")
         else:
             audio_thread = threading.Thread(target=self.transcriber.start_recording, daemon=True)
@@ -315,28 +340,60 @@ def setup_session_logging(log_dir: str = "realtime_sessions") -> str:
 
 
 if __name__ == "__main__":
-    HF_TOKEN = "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"
+    HF_TOKEN = "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"
+
+    print("\n📌 Mode:")
+    print("  [1] Webcam + Microphone (default)")
+    print("  [2] Video file")
+    print("  [3] Meeting mode (screen capture + system audio)")
+    mode_input = input("Choose mode (1/2/3): ").strip()
 
     video_file = None
-    while True:
-        video_file_input = input("Path to video file (Enter to use webcam/microphone): ").strip()
-        if not video_file_input:
-            break
-        if os.path.isfile(video_file_input):
-            video_file = video_file_input
-            break
-        print(f"❌ File not found: {video_file_input!r} — try again.")
-
+    screen_region = None
     audio_device = None
+
+    if mode_input == "2":
+        while True:
+            video_file_input = input("Path to video file: ").strip()
+            if os.path.isfile(video_file_input):
+                video_file = video_file_input
+                break
+            print(f"❌ File not found: {video_file_input!r} — try again.")
+
+    elif mode_input == "3":
+        # Meeting mode: screen capture + system audio (loopback)
+        import mss
+        sct = mss.mss()
+        monitors = sct.monitors
+        print("\n🖥️  Available monitors:")
+        for i, m in enumerate(monitors):
+            if i == 0:
+                print(f"  [0] Full virtual screen ({m['width']}x{m['height']})")
+            else:
+                print(f"  [{i}] Monitor {i} ({m['width']}x{m['height']} at {m['left']},{m['top']})")
+        mon_input = input("Monitor number (Enter for primary): ").strip()
+        mon_idx = int(mon_input) if mon_input.isdigit() else 1
+        screen_region = monitors[min(mon_idx, len(monitors) - 1)]
+        sct.close()
+        print(f"  Capturing: {screen_region['width']}x{screen_region['height']}")
+
+    # Audio device selection (for webcam and meeting modes)
     if not video_file:
         import sounddevice as _sd
         print("\n🎤 Available input devices:")
         devices = _sd.query_devices()
         input_devices = [(i, d) for i, d in enumerate(devices) if d['max_input_channels'] > 0]
         for i, d in input_devices:
-            print(f"  [{i}] {d['name']}")
+            # Highlight loopback devices for meeting mode
+            hint = ""
+            name_lower = d['name'].lower()
+            if 'stereo mix' in name_lower or 'mixagem' in name_lower or 'loopback' in name_lower:
+                hint = "  ← SYSTEM AUDIO (recommended for meeting mode)" if screen_region else ""
+            print(f"  [{i}] {d['name']}{hint}")
         default_idx = _sd.default.device[0]
         print(f"\nCurrent default: [{default_idx}] {devices[default_idx]['name']}")
+        if screen_region:
+            print("💡 For meeting mode, select the Stereo Mix / Mixagem Estereo device.")
         dev_input = input("Input device number (Enter to use default): ").strip()
         audio_device = int(dev_input) if dev_input.isdigit() else None
 
@@ -349,5 +406,6 @@ if __name__ == "__main__":
         print("No speaker limit")
 
     setup_session_logging()
-    app = MultimodalFusion(HF_TOKEN, num_speakers=num_speakers, audio_device=audio_device, video_file=video_file)
+    app = MultimodalFusion(HF_TOKEN, num_speakers=num_speakers, audio_device=audio_device,
+                           video_file=video_file, screen_region=screen_region)
     app.run()

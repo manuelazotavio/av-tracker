@@ -80,18 +80,25 @@ class MultiSpeakerVerifier:
                 self._raw_embeddings[name] = list(tensors)
                 continue
             # Group by greedy clustering: each tensor joins the group with highest sim
-            groups = []  # list of list[tensor]
+            # Uses centroid comparison instead of first-element to reduce fragmentation
+            groups = []       # list of list[tensor]
+            centroids = []    # parallel list of normalized centroids
             for t in tensors:
-                placed = False
-                for g in groups:
-                    rep = g[0]
-                    sim = torch.nn.functional.cosine_similarity(t, rep, dim=0).item()
-                    if sim >= SAME_PERSON_SIM:
-                        g.append(t)
-                        placed = True
-                        break
-                if not placed:
+                best_idx, best_sim = -1, -1.0
+                for gi, centroid in enumerate(centroids):
+                    sim = torch.nn.functional.cosine_similarity(t, centroid, dim=0).item()
+                    if sim > best_sim:
+                        best_sim, best_idx = sim, gi
+                if best_sim >= SAME_PERSON_SIM:
+                    groups[best_idx].append(t)
+                    # Recompute centroid
+                    new_c = torch.stack(groups[best_idx]).mean(dim=0)
+                    nn = torch.norm(new_c)
+                    centroids[best_idx] = new_c / nn if nn > 0 else new_c
+                else:
                     groups.append([t])
+                    nn = torch.norm(t)
+                    centroids.append(t / nn if nn > 0 else t)
             for idx, g in enumerate(groups):
                 key = name if idx == 0 else f"{name} {idx + 1}"
                 avg = torch.stack(g).mean(dim=0)
