@@ -167,9 +167,9 @@ class MultimodalFusion:
                 lines.append(f"  {key:30s} avg={sum(vals)/len(vals):6.1f}ms  min={min(vals):5.1f}ms  max={max(vals):5.1f}ms  n={len(vals)}")
             print("\n".join(lines))
 
-        # In file mode, limit to ~5 fps to reduce GPU memory pressure
-        # (video decodes at full speed but detection/embedding is expensive)
-        _target_fps = 5 if self.video_file else 30
+        # In file mode, 10 fps gives ASD enough frames per segment.
+        # 5 fps was causing ASD=None for most short diarization segments (< 1s).
+        _target_fps = 10 if self.video_file else 30
         _frame_interval = 1.0 / _target_fps
         _last_frame_time = 0.0
 

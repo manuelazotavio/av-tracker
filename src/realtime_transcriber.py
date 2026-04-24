@@ -103,6 +103,17 @@ def _normalize_name_token(name: str) -> str:
 NAMES_MALE_NORMALIZED = {_normalize_name_token(n) for n in NAMES_MALE}
 NAMES_FEMALE_NORMALIZED = {_normalize_name_token(n) for n in NAMES_FEMALE}
 
+
+def _gender_of(name: str) -> str | None:
+    """Return 'male'/'female' based on first name lookup, or None if unknown."""
+    base = _normalize_name_token(name.split()[0] if name else "")
+    if base in NAMES_FEMALE_NORMALIZED:
+        return "female"
+    if base in NAMES_MALE_NORMALIZED:
+        return "male"
+    return None
+
+
 def _init_heavy_deps():
     global torch, torchaudio, T, Pipeline, WhisperModel, SepformerSeparation, EncoderClassifier
     global MultiSpeakerVerifier, login, snapshot_download, spacy_nlp, hf_pipeline_func
@@ -166,6 +177,10 @@ class RealtimeTranscriber:
         # embedding_key (name in verifier) -> stable person_id
         self._emb_to_pid = self.shared_state.setdefault("embedding_to_person", {})
         self.identified_speakers = set()   # set of person_ids with confirmed real name
+        self._voice_emb_saved = set()      # speaker_ids with auto-saved voice embeddings
+        self._fv_bind_last = {}            # name -> timestamp of last face-voice binding
+        self._session_to_face = {}         # session_id -> person_id (face-confirmed binding)
+        self._session_gender = {}          # session_id -> 'male'/'female'
         self._session_unknown_embs = {}    # person_id -> np.array embedding
         self._session_unknown_counter = 0
         if num_speakers:
@@ -475,14 +490,25 @@ class RealtimeTranscriber:
                 if len(seg) >= int(16000 * 0.5):
                     spk_segments[spk].append(seg)
 
-            # Use SepFormer session hints if available, otherwise compute from diarization
+            # Use SepFormer session hints if available, otherwise compute from diarization.
+            # Pass audio_gender so that male/female speakers always get different session IDs.
             if _sep_spk_to_session:
                 spk_to_session = _sep_spk_to_session
             else:
-                spk_to_session = {
-                    spk: self._get_or_create_session_speaker_id(np.concatenate(segs))
-                    for spk, segs in spk_segments.items()
-                }
+                spk_to_session = {}
+                for spk, segs in spk_segments.items():
+                    concat_audio = np.concatenate(segs)
+                    spk_gender = self._detect_gender_from_audio(concat_audio)
+                    spk_to_session[spk] = self._get_or_create_session_speaker_id(
+                        concat_audio, audio_gender=spk_gender
+                    )
+                # Remap session IDs that are already face-bound so that session_hint
+                # arrives as the unified face identity instead of a raw spk_N.
+                for spk in list(spk_to_session.keys()):
+                    sid = spk_to_session[spk]
+                    face_pid = self._session_to_face.get(sid)
+                    if face_pid and face_pid in self.speaker_names:
+                        spk_to_session[spk] = face_pid
 
             # Group consecutive new-zone turns by speaker, keeping order
             MIN_SEGMENT_S = 2.0
@@ -660,14 +686,6 @@ class RealtimeTranscriber:
                 cand_str = "no embedding"
             logger.debug(f"Verifier: [{cand_str}] gender={audio_gender} threshold={self.verifier.threshold}")
 
-            def _gender_of(name):
-                base = _normalize_name_token(name.split()[0] if name else "")
-                if base in NAMES_FEMALE_NORMALIZED:
-                    return "female"
-                if base in NAMES_MALE_NORMALIZED:
-                    return "male"
-                return None
-
             # Filter candidates: remove those that contradict the audio gender
             if audio_gender and all_candidates:
                 filtered = []
@@ -705,12 +723,15 @@ class RealtimeTranscriber:
 
             # --- ASD: query which face was moving during the segment ---
             asd_person_id = None
+            asd_track_id = None
+            _ASD_PAD = 0.4  # expand ASD query window to capture frames near segment edges
             asd = self.shared_state.get("asd")
             if asd and wall_time_start is not None and active_faces:
                 t_end = wall_time_end if wall_time_end is not None else wall_time_start + len(audio_np) / 16000
-                asd_track = asd.get_active_speaker(wall_time_start, t_end)
+                asd_track = asd.get_active_speaker(wall_time_start - _ASD_PAD, t_end + _ASD_PAD)
                 if asd_track is not None and asd_track in active_faces:
                     asd_person_id = active_faces[asd_track]
+                    asd_track_id = asd_track
 
             # LOG: visual state
             faces_str = ", ".join(f"t{tid}={self.speaker_names.get(pid, pid)}" for tid, pid in active_faces.items())
@@ -721,7 +742,12 @@ class RealtimeTranscriber:
             # contradicts the candidate name (e.g., female voice → "Arthur").
             # This catches contaminated embeddings (wrong person's voice saved under another name).
             _verifier_name_gender = _gender_of(real_name) if real_name != "Unknown" else None
-            _verifier_gender_ok = not (audio_gender and _verifier_name_gender and audio_gender != _verifier_name_gender)
+            # Skip gender check when verifier confidence is very high (≥ 0.90) —
+            # biometric voice match is far more reliable than audio pitch analysis.
+            _verifier_gender_ok = (
+                conf >= 0.90
+                or not (audio_gender and _verifier_name_gender and audio_gender != _verifier_name_gender)
+            )
             _raw_name_gender = _gender_of(raw_best_name) if raw_best_name and raw_best_name != "Unknown" else None
             _raw_gender_ok = not (audio_gender and _raw_name_gender and audio_gender != _raw_name_gender)
 
@@ -788,11 +814,17 @@ class RealtimeTranscriber:
                         verified_name = self.speaker_names.get(speaker_id)
                         decision = f"SINGLE_FACE ({raw_conf:.2f})"
                     elif session_hint is not None:
-                        speaker_id = session_hint
-                        verified_name = None
-                        decision = "SESSION_HINT"
+                        _face_bound = self._session_to_face.get(session_hint)
+                        if _face_bound is not None and _face_bound in self.speaker_names:
+                            speaker_id = _face_bound
+                            verified_name = self.speaker_names.get(_face_bound)
+                            decision = f"SESSION_FACE ({self.speaker_names.get(_face_bound, _face_bound)})"
+                        else:
+                            speaker_id = session_hint
+                            verified_name = None
+                            decision = "SESSION_HINT"
                     else:
-                        speaker_id = self._get_or_create_session_speaker_id(audio_np)
+                        speaker_id = self._get_or_create_session_speaker_id(audio_np, audio_gender=audio_gender)
                         verified_name = None
                         decision = f"SESSION_TRACKER ({speaker_id})"
             elif asd_person_id is not None:
@@ -812,13 +844,64 @@ class RealtimeTranscriber:
                 speaker_id = visual_people[0]
                 verified_name = self.speaker_names.get(speaker_id)
                 decision = f"SINGLE_FACE ({raw_conf:.2f})"
+            elif (len(visual_people) == 1 or len(visual_people) >= 2) and asd is not None and wall_time_start is not None:
+                # 6) ASD_GUESS: try a weaker "best guess" based on relative mouth movement.
+                #    Covers both cases:
+                #    - 2+ faces: need dominance (ratio check inside get_best_guess)
+                #    - 1 face + num_speakers>=2: FACE_ONLY/SINGLE_FACE are blocked,
+                #      but any mouth movement is enough (1 face = trivially dominant)
+                # Conflict check: reject ASD_GUESS if the face returned is already bound
+                # to a DIFFERENT session_id. E.g.: face A is bound to SPEAKER_0 (Manuela),
+                # but this segment is SPEAKER_1 (Kauan) — ASD_GUESS should not override.
+                t_end_fb = wall_time_end if wall_time_end is not None else wall_time_start + len(audio_np) / 16000
+                guess_track = asd.get_best_guess(wall_time_start - _ASD_PAD, t_end_fb + _ASD_PAD)
+                _asd_guess_ok = False
+                if guess_track is not None and guess_track in active_faces:
+                    _guess_pid = active_faces[guess_track]
+                    # Build inverse map: person_id → which session_id it was bound to
+                    _bound_session = next(
+                        (s for s, p in self._session_to_face.items() if p == _guess_pid), None
+                    )
+                    # Allow if: no prior binding, OR bound to the SAME session_hint
+                    if _bound_session is None or session_hint is None or _bound_session == session_hint:
+                        _asd_guess_ok = True
+                    else:
+                        logger.debug(
+                            f"ASD_GUESS conflict: face {_guess_pid} is bound to "
+                            f"{_bound_session}, session_hint={session_hint} — rejecting"
+                        )
+                if _asd_guess_ok:
+                    asd_person_id = _guess_pid
+                    asd_track_id = guess_track
+                    speaker_id = asd_person_id
+                    verified_name = self.speaker_names.get(asd_person_id)
+                    decision = f"ASD_GUESS ({self.speaker_names.get(asd_person_id, asd_person_id)})"
+                elif session_hint is not None:
+                    _face_bound = self._session_to_face.get(session_hint)
+                    if _face_bound is not None and _face_bound in self.speaker_names:
+                        speaker_id = _face_bound
+                        verified_name = self.speaker_names.get(_face_bound)
+                        decision = f"SESSION_FACE ({self.speaker_names.get(_face_bound, _face_bound)})"
+                    else:
+                        speaker_id = session_hint
+                        verified_name = None
+                        decision = "SESSION_HINT"
+                else:
+                    speaker_id = self._get_or_create_session_speaker_id(audio_np, audio_gender=audio_gender)
+                    verified_name = None
+                    decision = f"SESSION_TRACKER ({speaker_id})"
             elif session_hint is not None:
-                # Use the person_id pre-computed by diarization (avoids mixing voices)
-                speaker_id = session_hint
-                verified_name = None
-                decision = "SESSION_HINT"
+                _face_bound = self._session_to_face.get(session_hint)
+                if _face_bound is not None and _face_bound in self.speaker_names:
+                    speaker_id = _face_bound
+                    verified_name = self.speaker_names.get(_face_bound)
+                    decision = f"SESSION_FACE ({self.speaker_names.get(_face_bound, _face_bound)})"
+                else:
+                    speaker_id = session_hint
+                    verified_name = None
+                    decision = "SESSION_HINT"
             else:
-                speaker_id = self._get_or_create_session_speaker_id(audio_np)
+                speaker_id = self._get_or_create_session_speaker_id(audio_np, audio_gender=audio_gender)
                 verified_name = None
                 decision = f"SESSION_TRACKER ({speaker_id})"
 
@@ -909,12 +992,28 @@ class RealtimeTranscriber:
                                 decision = f"GENDER_VERIFIER_HINT ({raw_best_name} {raw_conf:.2f})"
                             else:
                                 rejected_id = speaker_id
-                                speaker_id = self._get_or_create_session_speaker_id(audio_np, exclude_ids={rejected_id})
+                                speaker_id = self._get_or_create_session_speaker_id(audio_np, exclude_ids={rejected_id}, audio_gender=audio_gender)
                                 verified_name = None
                                 decision = f"GENDER_OVERRIDE ({audio_gender}!={name_gender})"
 
             # LOG: final decision
             logger.info(f"Decision: {decision} -> {verified_name or speaker_id}")
+
+            # Bind session_hint to confirmed face decision so future segments of the
+            # same diarization label resolve to the same face instead of spk_N.
+            _face_decisions = ("ASD", "ASD_GUESS", "FACE_ONLY", "SINGLE_FACE",
+                               "GENDER_FACE", "GENDER_REROUTE", "VERIFIER_HIGH",
+                               "VERIFIER_MOD", "VERIFIER_WEAK")
+            if session_hint is not None and any(decision.startswith(d) for d in _face_decisions):
+                self._session_to_face[session_hint] = speaker_id
+                # Mirror the session embedding into the face ID's slot so the
+                # voice tracker can match directly to the face ID in future chunks,
+                # unifying the two parallel ID spaces (spk_N ↔ Person_N).
+                if (session_hint in self._session_unknown_embs
+                        and speaker_id not in self._session_unknown_embs):
+                    self._session_unknown_embs[speaker_id] = self._session_unknown_embs[session_hint].copy()
+                    if session_hint in self._session_gender:
+                        self._session_gender[speaker_id] = self._session_gender[session_hint]
 
             # --- FALSE NEGATIVE DETECTION ---
             # When the decision is NOT from the verifier, check if the verifier
@@ -982,12 +1081,40 @@ class RealtimeTranscriber:
                 if not self._is_generic_name(verified_name):
                     self.identified_speakers.add(speaker_id)  # track by person_id
 
-            # Accumulate the chunk BEFORE trying to detect name, so that the segment
-            # where the name is spoken is available when creating the embedding.
-            speakers_full = self.num_speakers and len(self.identified_speakers) >= self.num_speakers
-            current_name_pre = self.speaker_names.get(speaker_id)
-            if (not current_name_pre or self._is_generic_name(current_name_pre)) and not speakers_full:
-                self.unknown_speakers_audio[speaker_id].append(audio_np.copy())
+            # Always accumulate audio for every speaker — needed for creating
+            # voice embeddings when they get identified (by name, context, or LLM).
+            # Limit buffer to ~60s per speaker to prevent unbounded memory growth.
+            _MAX_CHUNKS_PER_SPEAKER = 30  # ~60s at 2s/chunk
+            buf = self.unknown_speakers_audio[speaker_id]
+            buf.append(audio_np.copy())
+            if len(buf) > _MAX_CHUNKS_PER_SPEAKER:
+                buf.pop(0)
+
+            # Auto-save voice embedding for speakers WITHOUT existing embeddings.
+            # - Generic names (spk_N, Person_N): always save so validation can rename them.
+            # - Named speakers already in verifier.embeddings: skip — _try_auto_enroll
+            #   handles them with stricter quality checks. Saving here would contaminate
+            #   their centroid if the verifier made a false-positive attribution.
+            _MIN_CHUNKS_FOR_EMB = 1  # save after first segment (~2s)
+            _current = self.speaker_names.get(speaker_id, speaker_id)
+            _current = re.sub(r'\s+\d+$', '', _current)  # strip homonym suffix
+            _has_existing_emb = (not self._is_generic_name(_current)
+                                 and _current in self.verifier.embeddings)
+            if (speaker_id not in self._voice_emb_saved
+                    and len(buf) >= _MIN_CHUNKS_FOR_EMB
+                    and not _has_existing_emb):
+                self._save_live_embedding(speaker_id, _current)
+                self._voice_emb_saved.add(speaker_id)
+
+            # Face-voice binding: if ASD confirmed a face-recognized person is
+            # speaking but the verifier has no voice embedding for them yet,
+            # create one from this audio — face identity bootstraps voice identity.
+            if asd_person_id is not None and asd_track_id is not None:
+                threading.Thread(
+                    target=self._try_face_voice_binding,
+                    args=(asd_track_id, audio_np.copy()),
+                    daemon=True,
+                ).start()
 
             self._update_speaker_names_incremental(speaker_id, text, audio_np)
 
@@ -1174,24 +1301,130 @@ class RealtimeTranscriber:
             else:
                 display_label = f"({speaker_id})"
             timestamp = datetime.now().strftime("%H:%M:%S")
-            print(f"\n[{timestamp}] {display_label}: {text}")
-            self.full_transcript.append({"speaker": speaker_id, "verified_name": final_name, "text": text, "timestamp": datetime.now()})
+
+            # Dedup: short padded segments from the same speaker can produce identical
+            # transcriptions. Skip if this text is >80% similar to a recent entry from
+            # the same speaker within the last 5 seconds.
+            _now = datetime.now()
+            _norm = lambda t: re.sub(r'[^\w\s]', '', t.lower()).strip()
+            _is_dup = False
+            for _prev in reversed(self.full_transcript[-6:]):
+                # Cross-speaker dedup: padded segments produce the same text regardless
+                # of which speaker_id was assigned — check any recent entry within 5s.
+                if (_now - _prev["timestamp"]).total_seconds() <= 5.0:
+                    _ratio = SequenceMatcher(None, _norm(text), _norm(_prev["text"])).ratio()
+                    if _ratio >= 0.80:
+                        logger.debug(f"Dedup: skipped near-duplicate ({_ratio:.2f}): '{text[:50]}'")
+                        _is_dup = True
+                        break
+            if not _is_dup:
+                print(f"\n[{timestamp}] {display_label}: {text}")
+                self.full_transcript.append({"speaker": speaker_id, "verified_name": final_name, "text": text, "timestamp": _now})
         except Exception as e:
             print(f"Error processing segment: {e}")
         finally:
             self._log_perf("segment_total", (time.perf_counter() - _t0_seg) * 1000)
 
+    def _try_face_voice_binding(self, asd_track_id, audio_np):
+        """Face-voice binding: when ASD confirms a face-recognized person is speaking,
+        create a voice embedding so face identity bootstraps voice identity."""
+        try:
+            face_tracker = self.shared_state.get("face_tracker")
+            if face_tracker is None:
+                return
+
+            # 1. Get the face-recognized name for this track
+            face_name = face_tracker._track_to_name.get(asd_track_id)
+            if not face_name or self._is_generic_name(face_name):
+                return  # face not recognized as a known person
+
+            # 2. Voice embedding already exists? Nothing to do.
+            if face_name in self.verifier.embeddings:
+                return
+
+            # 3. Cooldown (120s per name)
+            now = time.time()
+            if now - self._fv_bind_last.get(face_name, 0.0) < 120.0:
+                return
+            self._fv_bind_last[face_name] = now
+
+            # 4. Audio quality gate
+            if len(audio_np) < 3 * self.sample_rate:
+                return
+            rms = float(np.sqrt(np.mean(audio_np ** 2)))
+            if rms < 1e-4:
+                return  # near-silent
+
+            # 5. Gender sanity check
+            audio_gender = self._detect_gender_from_audio(audio_np)
+            if audio_gender:
+                name_gender = _gender_of(face_name)
+                if name_gender and name_gender != audio_gender:
+                    logger.debug(f"[FaceVoiceBind] Gender mismatch: audio={audio_gender} face={face_name}({name_gender})")
+                    return
+
+            # 6. Save voice embedding
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            emb_dir = os.path.join(base_dir, "data", "embeddings")
+
+            mx = np.abs(audio_np).max()
+            if mx > 0:
+                audio_np = audio_np / mx
+            signal = torch.from_numpy(audio_np).float().to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                embedding = self.classifier.encode_batch(signal).squeeze().cpu().numpy()
+            norm_val = np.linalg.norm(embedding)
+            if norm_val > 0:
+                embedding = embedding / norm_val
+
+            os.makedirs(emb_dir, exist_ok=True)
+            filename = f"{face_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_fvbind.npy"
+            np.save(os.path.join(emb_dir, filename), embedding)
+
+            # Register in verifier memory immediately
+            emb_tensor = torch.from_numpy(embedding).float().to(self.verifier.device)
+            self.verifier.embeddings[face_name] = emb_tensor
+            self.verifier._raw_embeddings.setdefault(face_name, []).append(emb_tensor)
+
+            # Register in shared_state registry
+            if face_name not in self._emb_to_pid:
+                for tid, pid in self.shared_state.get("active_faces", {}).items():
+                    if face_tracker._track_to_name.get(tid) == face_name:
+                        self._emb_to_pid[face_name] = pid
+                        self.speaker_names[pid] = face_name
+                        self.identified_speakers.add(pid)
+                        break
+
+            # Sync to database
+            try:
+                from src.database import get_db
+                db = get_db()
+                spk_id = db.add_speaker(face_name)
+                db.save_voice_embedding(spk_id, embedding, source_file=filename)
+            except Exception as db_err:
+                logger.warning(f"[FaceVoiceBind] DB sync failed: {db_err}")
+
+            logger.info(f"[FaceVoiceBind] Voice embedding created for '{face_name}' (face+ASD): {filename}")
+        except Exception as e:
+            logger.error(f"[FaceVoiceBind] Failed for track {asd_track_id}: {e}")
+
     def _try_auto_enroll(self, name: str, audio_np):
         """Try to save an automatic embedding for a speaker identified with high confidence."""
         try:
+            # Strip homonym suffix ("Arthur 2" → "Arthur") — save under the base name
+            name = re.sub(r'\s+\d+$', '', name)
             saved = self.verifier.auto_enroll(name, audio_np)
             if saved:
                 logger.info(f"Auto-enroll: new embedding saved for '{name}'")
         except Exception as e:
             logger.debug(f"Auto-enroll failed ({name}): {e}")
 
-    def _get_or_create_session_speaker_id(self, audio_np, exclude_ids=None):
-        """Return stable session ID for unknown speaker using voice similarity."""
+    def _get_or_create_session_speaker_id(self, audio_np, exclude_ids=None, audio_gender=None):
+        """Return stable session ID for unknown speaker using voice similarity.
+
+        audio_gender: 'male'/'female'/None — prevents cross-gender merges so that
+        e.g. a female speaker is never merged with a male session bucket.
+        """
         exclude_ids = exclude_ids or set()
         signal = torch.from_numpy(audio_np).float().to(self.device).unsqueeze(0)
         with torch.no_grad():
@@ -1200,34 +1433,44 @@ class RealtimeTranscriber:
         if norm > 0:
             emb = emb / norm
 
-        # Find the closest speaker among those already known in this session
+        # Find the closest speaker — respecting gender constraint
         best_id, best_sim = None, -1.0
         for sid, known_emb in self._session_unknown_embs.items():
             if sid in exclude_ids:
+                continue
+            # Skip if gender is known for both and they differ
+            known_gender = self._session_gender.get(sid)
+            if audio_gender and known_gender and audio_gender != known_gender:
                 continue
             sim = float(np.dot(emb, known_emb))
             if sim > best_sim:
                 best_sim = sim
                 best_id = sid
 
-        # Threshold of 0.65 to separate distinct speakers without fragmenting the same speaker
-        if best_id and best_sim >= 0.65:
+        # Threshold: gender-aware.
+        # Cross-gender merges are blocked by the constraint above, so within-gender
+        # merges can use a low threshold (0.35) — recording variation across chunks
+        # causes same-person embeddings to land at 0.40-0.60.
+        # When gender is unknown for either side, use a moderate threshold (0.45).
+        _same_gender = (audio_gender and self._session_gender.get(best_id) == audio_gender)
+        _threshold = 0.35 if _same_gender else 0.45
+        if best_id and best_sim >= _threshold:
             alpha = 0.1
             self._session_unknown_embs[best_id] = (1 - alpha) * self._session_unknown_embs[best_id] + alpha * emb
+            if audio_gender and best_id not in self._session_gender:
+                self._session_gender[best_id] = audio_gender
             return best_id
 
-        # Respect the speaker limit: count all unique person_ids already assigned
+        # Respect the speaker limit — forced merge only if minimally plausible (>= 0.20)
         all_tracked = set(self.speaker_names.keys()) | set(self._session_unknown_embs.keys())
         if self.num_speakers and len(all_tracked) >= self.num_speakers:
-            if best_id:
+            if best_id and best_sim >= 0.20:
                 return best_id
-            # Fallback: pick first non-excluded session speaker
-            for sid in self._session_unknown_embs:
-                if sid not in exclude_ids:
-                    return sid
 
         new_id = self._new_person_id()
         self._session_unknown_embs[new_id] = emb
+        if audio_gender:
+            self._session_gender[new_id] = audio_gender
         return new_id
 
     def _normalize_audio(self, audio, target_db=-20.0):
@@ -1635,7 +1878,8 @@ class RealtimeTranscriber:
             logger.info(f"Identity updated: '{old_name}' -> '{name}'")
 
         # If came from session tracking, try to bind to a visible generic face
-        elif old_name is None and face_tracker:
+        # Skip when name itself is generic (auto-save) — don't rename faces to spk_001
+        elif old_name is None and face_tracker and not self._is_generic_name(name):
             active_faces = self.shared_state.get("active_faces", {})
             # active_faces = {track_id: person_id} -- find visible generic person_ids
             generic_pids = [

@@ -10,6 +10,7 @@ Usage:
 """
 import os
 import re
+import time
 import sqlite3
 import json
 import numpy as np
@@ -432,6 +433,21 @@ class TrackerDB:
             return d
 
     # -- Validation feedback ---------------------------------------------------
+    @staticmethod
+    def _emb_file_matches_name(filename: str, name: str) -> bool:
+        """Check if an embedding .npy file belongs to a given speaker name."""
+        base = os.path.splitext(filename)[0]
+        for suffix in ("_auto", "_fvbind"):
+            if base.endswith(suffix):
+                base = base[:-len(suffix)]
+                break
+        parts = base.split("_")
+        if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
+            file_name = "_".join(parts[:-2])
+        else:
+            file_name = base
+        return file_name == name
+
     def apply_validation_feedback(self, session_id: str, corrections: dict[int, tuple[str, str]]):
         """Apply validation corrections to improve future sessions.
 
@@ -441,29 +457,107 @@ class TrackerDB:
                          only includes lines where predicted != corrected
 
         Actions:
-            1. DELETE all .npy voice/face files for wrongly-attributed names
-               (they are contaminated with the wrong person's biometrics)
-            2. Deactivate corresponding embeddings in the DB
-            3. Register corrected speaker names in the DB
+            - Generic → ONE real name: RENAME embeddings (correct biometrics, just unlabeled)
+            - Generic → MULTIPLE real names: DELETE voice (contaminated audio),
+              RENAME face to majority vote (one face = one person)
+            - Wrong real name → correct name: DELETE embeddings (contaminated)
         """
+        from collections import Counter
+        _generic_re = re.compile(r'^(spk_\d+|Person_\d+|Desconhecido_\d+|Unknown(_\d+)?)$')
         base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
         voice_dir = os.path.join(base_dir, "data", "embeddings")
         face_dir = os.path.join(base_dir, "data", "face_embeddings")
 
-        # Build mapping: wrong_name → correct_name (from corrections)
-        renames = {}  # wrong -> correct
+        # Build mapping: old_name → list of corrected names (with counts)
+        generic_targets = {}   # generic_name → Counter({real_name: count})
+        wrong_renames = {}     # real_wrong → real_correct (delete contaminated)
         for seg_idx, (predicted, corrected) in corrections.items():
             if predicted != corrected and predicted and corrected:
-                if not re.match(r'^(spk_\d+|Person_\d+|Desconhecido_\d+|Unknown)$', predicted):
-                    renames[predicted] = corrected
+                if _generic_re.match(predicted):
+                    generic_targets.setdefault(predicted, Counter())[corrected] += 1
+                else:
+                    wrong_renames[predicted] = corrected
 
-        if not renames:
+        if not generic_targets and not wrong_renames:
             return []
 
         actions = []
+        # Track files created by generic renames so the wrong_renames step
+        # doesn't immediately delete them (they have correct biometrics).
+        protected_files: set[str] = set()   # absolute paths
 
-        for wrong_name, correct_name in renames.items():
-            # 1) Deactivate ALL voice embeddings under the wrong name in DB
+        # --- Generic names: decide rename vs delete per embedding type ---
+        for generic_name, target_counts in generic_targets.items():
+            majority_name = target_counts.most_common(1)[0][0]
+            is_ambiguous = len(target_counts) > 1  # maps to multiple people
+
+            # VOICE: if ambiguous → DELETE (mixed audio from multiple people)
+            #        if unambiguous → RENAME
+            if os.path.exists(voice_dir):
+                for f in list(os.listdir(voice_dir)):
+                    if not f.endswith(".npy") or not self._emb_file_matches_name(f, generic_name):
+                        continue
+                    fpath = os.path.join(voice_dir, f)
+                    if is_ambiguous:
+                        try:
+                            os.remove(fpath)
+                            actions.append(f"Deleted voice: {f} (mixed: {dict(target_counts)})")
+                        except OSError:
+                            pass
+                    else:
+                        new_f = f.replace(generic_name, majority_name, 1)
+                        new_path = os.path.join(voice_dir, new_f)
+                        if os.path.exists(new_path):
+                            # Avoid collision: add timestamp to make unique
+                            base, ext = os.path.splitext(new_f)
+                            new_f = f"{base}_{int(time.time())}{ext}"
+                            new_path = os.path.join(voice_dir, new_f)
+                        try:
+                            os.rename(fpath, new_path)
+                            protected_files.add(new_path)
+                            actions.append(f"Renamed voice: {f} → {new_f}")
+                        except OSError:
+                            pass
+
+            # FACE: always RENAME to majority (one face embedding = one physical face)
+            if os.path.exists(face_dir):
+                for f in list(os.listdir(face_dir)):
+                    if not f.endswith(".npy") or not self._emb_file_matches_name(f, generic_name):
+                        continue
+                    new_f = f.replace(generic_name, majority_name, 1)
+                    old_path = os.path.join(face_dir, f)
+                    new_path = os.path.join(face_dir, new_f)
+                    if not os.path.exists(new_path):
+                        try:
+                            os.rename(old_path, new_path)
+                            protected_files.add(new_path)
+                            actions.append(f"Renamed face: {f} → {new_f}")
+                        except OSError:
+                            pass
+
+            # Update DB
+            correct_spk = self.add_speaker(majority_name)
+            with self._cursor() as cur:
+                cur.execute("SELECT id FROM speakers WHERE name = ?", (generic_name,))
+                row = cur.fetchone()
+                if row:
+                    generic_spk_id = row["id"]
+                    if is_ambiguous:
+                        # Deactivate voice (contaminated), keep face
+                        cur.execute("""
+                            UPDATE voice_embeddings SET is_active = 0
+                            WHERE speaker_id = ? AND is_active = 1
+                        """, (generic_spk_id,))
+                    cur.execute("""
+                        UPDATE face_embeddings SET speaker_id = ?
+                        WHERE speaker_id = ? AND is_active = 1
+                    """, (correct_spk, generic_spk_id))
+                    if cur.rowcount:
+                        actions.append(f"DB: re-associated embeddings {generic_name} → {majority_name}")
+
+        # --- Wrong real name → correct name: DELETE contaminated embeddings ---
+        for wrong_name, correct_name in wrong_renames.items():
+            # 1) Deactivate voice embeddings in DB
             with self._cursor() as cur:
                 cur.execute("""
                     SELECT ve.id FROM voice_embeddings ve
@@ -474,7 +568,7 @@ class TrackerDB:
                     self.deactivate_voice_embedding(row["id"])
                     actions.append(f"DB: deactivated voice emb {row['id']} ({wrong_name})")
 
-            # 2) Deactivate ALL face embeddings under the wrong name in DB
+            # 2) Deactivate face embeddings in DB
             with self._cursor() as cur:
                 cur.execute("""
                     SELECT fe.id FROM face_embeddings fe
@@ -485,26 +579,23 @@ class TrackerDB:
                     self.deactivate_face_embedding(row["id"])
                     actions.append(f"DB: deactivated face emb {row['id']} ({wrong_name})")
 
-            # 3) DELETE all .npy files on disk for the wrong name
-            #    These are what the verifier/tracker actually load — DB alone isn't enough
+            # 3) DELETE .npy files on disk
+            #    Skip files that were just created by a generic rename — they
+            #    have correct biometrics (e.g. Person_6 → Manuela, then deleting
+            #    a previously wrong "Manuela" should not remove the new file).
             for emb_dir, emb_type in [(voice_dir, "voice"), (face_dir, "face")]:
                 if not os.path.exists(emb_dir):
                     continue
                 for f in list(os.listdir(emb_dir)):
                     if not f.endswith(".npy"):
                         continue
-                    # Match: "Arthur_20260331.npy", "Arthur_auto.npy", "Arthur.npy"
-                    base = os.path.splitext(f)[0]
-                    if base.endswith("_auto"):
-                        base = base[:-5]
-                    parts = base.split("_")
-                    if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
-                        file_name = "_".join(parts[:-2])
-                    else:
-                        file_name = base
-                    if file_name == wrong_name:
+                    fpath = os.path.join(emb_dir, f)
+                    if fpath in protected_files:
+                        actions.append(f"Kept {emb_type}: {f} (just renamed from generic, protected)")
+                        continue
+                    if self._emb_file_matches_name(f, wrong_name):
                         try:
-                            os.remove(os.path.join(emb_dir, f))
+                            os.remove(fpath)
                             actions.append(f"Deleted {emb_type}: {f} (was '{wrong_name}')")
                         except OSError:
                             pass

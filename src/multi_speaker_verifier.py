@@ -1,3 +1,4 @@
+import re
 import torch
 import torchaudio
 import os
@@ -27,9 +28,11 @@ class MultiSpeakerVerifier:
 
     @staticmethod
     def _clean_name(base):
-        """Extract clean name from filename base, removing _auto and _YYYYMMDD_HHMMSS suffixes."""
-        if base.endswith("_auto"):
-            base = base[:-5]  # strip _auto, then continue to remove timestamp
+        """Extract clean name from filename base, removing _auto/_fvbind and _YYYYMMDD_HHMMSS suffixes."""
+        for suffix in ("_auto", "_fvbind"):
+            if base.endswith(suffix):
+                base = base[:-len(suffix)]
+                break
         parts = base.split('_')
         if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
             return '_'.join(parts[:-2])
@@ -49,6 +52,10 @@ class MultiSpeakerVerifier:
             try:
                 if filename.endswith(".npy"):
                     name = self._clean_name(os.path.splitext(filename)[0])
+                    # Skip generic names — they exist on disk for validation
+                    # to rename, but must not compete with real embeddings.
+                    if re.match(r'^(spk_\d+|Person_\d+|Desconhecido_\d+|Unknown(_\d+)?)$', name):
+                        continue
                     emb_numpy = np.load(path)
                     emb_tensor = torch.from_numpy(emb_numpy).float().to(self.device)
                     accumulated.setdefault(name, []).append(emb_tensor)
@@ -71,9 +78,9 @@ class MultiSpeakerVerifier:
         # Group embeddings with the same name:
         # - High similarity between them → same speaker → average (multiple recordings)
         # - Low similarity               → homonyms     → unique keys "Name", "Name 2", ...
-        SAME_PERSON_SIM = 0.35  # below this, consider different people (actual homonyms)
-        # 0.35 is more permissive: same person under different conditions (indoor/outdoor, different mic)
-        # keeps in a single cluster instead of generating "Joao 2", "Joao 3" etc.
+        SAME_PERSON_SIM = 0.20  # below this, consider different people (actual homonyms)
+        # Short clips (~2s) produce noisy embeddings with sim 0.2-0.4 for the same person.
+        # 0.20 avoids false homonym splits while still separating truly different people (sim < 0.15).
         for name, tensors in accumulated.items():
             if len(tensors) == 1:
                 self.embeddings[name] = tensors[0]

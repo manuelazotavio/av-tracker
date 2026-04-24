@@ -105,7 +105,20 @@ def render():
 
     key = f"corrections_{os.path.basename(selected)}"
     if key not in st.session_state:
-        st.session_state[key] = {}
+        # Load previous validation if it exists
+        ts_match = re.search(r'(\d{8}_\d{6})', os.path.basename(selected))
+        prev_corrections = {}
+        if ts_match:
+            val_file = os.path.join(SESSIONS_DIR, f"validated_{ts_match.group(1)}.txt")
+            if os.path.exists(val_file):
+                val_entries = _parse_transcript(val_file)
+                for i, (orig, val) in enumerate(zip(entries, val_entries)):
+                    if val["speaker"] != orig["speaker"]:
+                        prev_corrections[i] = val["speaker"]
+                    else:
+                        prev_corrections[i] = orig["speaker"]
+                st.info(f"Loaded previous validation ({len([v for i,v in prev_corrections.items() if v != entries[i]['speaker']])} corrections)")
+        st.session_state[key] = prev_corrections
     corrections = st.session_state[key]
 
     # Bulk rename

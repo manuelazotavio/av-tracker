@@ -26,7 +26,7 @@ class _EdgeFaceXXS(nn.Module):
 
 class PersonIDTracker:
     MATCH_THRESHOLD = 0.55  # cosine similarity to consider a known person
-    MERGE_THRESHOLD = 0.60  # threshold for merging during auto-enrollment (must be > MATCH)
+    MERGE_THRESHOLD = 0.55  # threshold for merging during auto-enrollment (same as MATCH)
     ENROLL_FRAMES = 50      # frames to accumulate (~5s) for more stable average embedding
     CONFIRM_FRAMES = 10     # consecutive frames needed to confirm a known-name assignment
 
@@ -74,6 +74,10 @@ class PersonIDTracker:
                     name = '_'.join(parts[:-2])
                 else:
                     name = base
+                # Skip generic names — they exist on disk for validation
+                # to rename, but must not compete with real face embeddings.
+                if re.match(r'^(Person_\d+|Unknown(_\d+)?)$', name):
+                    continue
                 emb = np.load(os.path.join(emb_dir, file))
                 _raw_face_embs.setdefault(name, []).append(emb)
                 self._emb_files[name] = file
@@ -222,6 +226,8 @@ class PersonIDTracker:
         self.known_embeddings[name] = avg_emb
         self._track_to_name[track_id] = name
 
+        # Save to disk so validation can rename later.
+        # The face tracker skips generic names when loading (no cross-session competition).
         if self.emb_dir:
             os.makedirs(self.emb_dir, exist_ok=True)
             filename = f"{name}_auto.npy"
@@ -283,26 +289,30 @@ class PersonIDTracker:
         if self.emb_dir:
             from datetime import datetime as _dt
             old_file = self._emb_files.pop(old_name, None)
+            ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+            new_file = f"{new_name}_{ts}_auto.npy"
+            new_path = os.path.join(self.emb_dir, new_file)
             if old_file:
                 old_path = os.path.join(self.emb_dir, old_file)
-                ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-                new_file = f"{new_name}_{ts}_auto.npy"
-                new_path = os.path.join(self.emb_dir, new_file)
                 if os.path.exists(old_path):
                     os.rename(old_path, new_path)
-                self._emb_files[new_name] = new_file
-                # Limit total files per person to prevent bloat (keep newest)
-                MAX_FACE_FILES = 8
-                all_files = sorted(
-                    [f for f in os.listdir(self.emb_dir)
-                     if f.endswith(".npy") and f.startswith(new_name)],
-                )
-                if len(all_files) > MAX_FACE_FILES:
-                    for old_f in all_files[:len(all_files) - MAX_FACE_FILES]:
-                        try:
-                            os.remove(os.path.join(self.emb_dir, old_f))
-                        except OSError:
-                            pass
+            elif new_name in self.known_embeddings:
+                # Generic Person_N was not saved to disk — save now under the real name
+                os.makedirs(self.emb_dir, exist_ok=True)
+                np.save(new_path, self.known_embeddings[new_name])
+            self._emb_files[new_name] = new_file
+            # Limit total files per person to prevent bloat (keep newest)
+            MAX_FACE_FILES = 8
+            all_files = sorted(
+                [f for f in os.listdir(self.emb_dir)
+                 if f.endswith(".npy") and f.startswith(new_name)],
+            )
+            if len(all_files) > MAX_FACE_FILES:
+                for old_f in all_files[:len(all_files) - MAX_FACE_FILES]:
+                    try:
+                        os.remove(os.path.join(self.emb_dir, old_f))
+                    except OSError:
+                        pass
         # Cleanup orphan Person_N files: if no track uses the old generic name anymore,
         # delete the file from disk to prevent accumulation across sessions.
         if self.emb_dir and old_name and re.match(r'^Person_\d+$', old_name):

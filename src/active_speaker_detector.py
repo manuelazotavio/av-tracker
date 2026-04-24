@@ -9,9 +9,12 @@ No additional models — uses only the already-processed camera frames.
 """
 
 import time
+import logging
 import cv2
 import numpy as np
 from collections import deque
+
+logger = logging.getLogger(__name__)
 
 
 class ActiveSpeakerDetector:
@@ -19,8 +22,8 @@ class ActiveSpeakerDetector:
     MOUTH_TOP_RATIO  = 0.60
     MOUTH_SIDE_MARGIN = 0.15
 
-    def __init__(self, buffer_seconds: float = 15.0, min_frames: int = 5,
-                 dominant_ratio: float = 1.6):
+    def __init__(self, buffer_seconds: float = 15.0, min_frames: int = 2,
+                 dominant_ratio: float = 1.4):
         """
         Args:
             buffer_seconds: history window kept in memory.
@@ -96,6 +99,11 @@ class ActiveSpeakerDetector:
     # ------------------------------------------------------------------
     # Query: who was speaking during [time_start, time_end]?
     # ------------------------------------------------------------------
+    # Minimum mean pixel-diff to be considered "active" (not just background noise).
+    # Typical values: non-speaking faces 0.3-1.0, speaking faces 3-15+.
+    # Low-res or compressed video may have lower overall values.
+    NOISE_FLOOR = 1.5
+
     def get_active_speaker(self, time_start: float, time_end: float) -> int | None:
         """Returns track_id of the most active speaker in the window, or None if uncertain.
 
@@ -111,16 +119,67 @@ class ActiveSpeakerDetector:
 
         if not scores:
             return None
-        if len(scores) == 1:
-            return next(iter(scores))
 
         sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        best_id,  best_score  = sorted_items[0]
-        _,        second_score = sorted_items[1]
+        best_id, best_score = sorted_items[0]
 
-        # Only returns if clearly dominant
-        if second_score > 0 and best_score / second_score < self._dominant_ratio:
+        scores_str = " | ".join(f"t{tid}:{s:.1f}" for tid, s in sorted_items)
+        logger.debug(f"ASD scores [{time_end - time_start:.2f}s window]: {scores_str}")
+
+        # Best face must be above noise floor to be considered speaking
+        if best_score < self.NOISE_FLOOR:
+            logger.debug(f"ASD=None: best score {best_score:.1f} < noise floor {self.NOISE_FLOOR}")
             return None
+
+        if len(scores) == 1:
+            return best_id
+
+        _, second_score = sorted_items[1]
+
+        # If second face is below noise floor, best is clearly the speaker
+        if second_score < self.NOISE_FLOOR:
+            logger.debug(f"ASD -> t{best_id} ({best_score:.1f}, second below noise)")
+            return best_id
+
+        # Both above noise floor — require dominant_ratio to avoid ties
+        ratio = best_score / second_score
+        if ratio < self._dominant_ratio:
+            logger.debug(f"ASD=None: ratio {ratio:.2f} < {self._dominant_ratio} (best={best_score:.1f} second={second_score:.1f})")
+            return None
+        logger.debug(f"ASD -> t{best_id} ({best_score:.1f}, ratio={ratio:.2f})")
+        return best_id
+
+    def get_best_guess(self, time_start: float, time_end: float) -> int | None:
+        """Fallback: returns the face with most mouth movement even below NOISE_FLOOR.
+
+        Used when the verifier has no match and get_active_speaker() returned None.
+        Only returns when the best face has score > 0 AND is clearly dominant (2x second).
+        """
+        scores: dict[int, float] = {}
+        for track_id, buf in self._activity.items():
+            window = [s for t, s in buf if time_start <= t <= time_end]
+            if len(window) >= self._min_frames:
+                scores[track_id] = float(np.mean(window))
+
+        if not scores:
+            return None
+
+        sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        best_id, best_score = sorted_items[0]
+
+        if best_score <= 0:
+            return None
+
+        if len(scores) == 1:
+            return best_id
+
+        _, second_score = sorted_items[1]
+
+        # Require best to be at least 1.5x the second
+        if second_score > 0 and best_score / second_score < 1.5:
+            return None
+
+        logger.debug(f"ASD_GUESS -> t{best_id} ({best_score:.1f}, below noise but dominant)")
         return best_id
 
     def get_scores(self, time_start: float, time_end: float) -> dict[int, float]:

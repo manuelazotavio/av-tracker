@@ -1,5 +1,5 @@
 """
-enroll_speaker.py — Adds voice embeddings for a known speaker.
+enroll_speaker.py -- Adds voice embeddings for a known speaker.
 
 Basic usage:
     python enroll_speaker.py "Isabel" audio.wav
@@ -9,12 +9,12 @@ Usage with multiple files:
     python enroll_speaker.py "Isabel" clip1.wav clip2.wav clip3.wav
 
 The script extracts the ECAPA-TDNN embedding and saves it to data/embeddings/.
-Each file generates a separate .npy — the verifier averages them automatically.
+Each file generates a separate .npy -- the verifier averages them automatically.
 
 Tips:
-  • Use clips of 10-60 seconds with clear voice and no background music.
-  • The more clips from different sessions, the better the generalization.
-  • Run for each person that should be recognized.
+  - Use clips of 10-60 seconds with clear voice and no background music.
+  - The more clips from different sessions, the better the generalization.
+  - Run for each person that should be recognized.
 """
 
 import os
@@ -47,7 +47,7 @@ def load_audio_ffmpeg(path: str, start: float = 0.0, end: float = None, sr: int 
         raise RuntimeError(f"ffmpeg failed:\n{result.stderr.decode()}")
     audio = np.frombuffer(result.stdout, dtype=np.float32).copy()
     if len(audio) == 0:
-        raise ValueError("Empty audio — check the file and time range.")
+        raise ValueError("Empty audio -- check the file and time range.")
     return audio
 
 
@@ -86,7 +86,7 @@ def main():
 
     os.makedirs(EMB_DIR, exist_ok=True)
 
-    print(f"\n🧠 Loading ECAPA-TDNN model...")
+    print(f"\nLoading ECAPA-TDNN model...")
     from speechbrain.inference.speaker import EncoderClassifier
     device = "cuda" if torch.cuda.is_available() else "cpu"
     classifier = EncoderClassifier.from_hparams(
@@ -98,32 +98,32 @@ def main():
     # Show existing embeddings for this name
     existing = list_existing(args.name)
     if existing:
-        print(f"\n📂 Existing embeddings for '{args.name}': {len(existing)} file(s)")
+        print(f"\nExisting embeddings for '{args.name}': {len(existing)} file(s)")
         for f in existing:
-            print(f"   • {f}")
+            print(f"   - {f}")
     else:
-        print(f"\n📂 No existing embedding for '{args.name}' — this will be the first.")
+        print(f"\nNo existing embedding for '{args.name}' -- this will be the first.")
 
     saved = []
     for audio_path in args.files:
         if not os.path.isfile(audio_path):
-            print(f"\n❌ File not found: {audio_path!r}")
+            print(f"\nFile not found: {audio_path!r}")
             continue
 
-        print(f"\n🎵 Processing: {audio_path}")
+        print(f"\nProcessing: {audio_path}")
         if args.start > 0 or args.end is not None:
-            print(f"   Segment: {args.start}s → {args.end or 'end'}")
+            print(f"   Segment: {args.start}s -> {args.end or 'end'}")
 
         try:
             audio = load_audio_ffmpeg(audio_path, start=args.start, end=args.end)
         except Exception as e:
-            print(f"   ❌ Error loading audio: {e}")
+            print(f"   Error loading audio: {e}")
             continue
 
         duration = len(audio) / 16000
         print(f"   Duration: {duration:.1f}s  |  Samples: {len(audio)}")
         if duration < 3.0:
-            print(f"   ⚠️  Segment too short (< 3s) — embedding quality may be low.")
+            print(f"   WARNING: Segment too short (< 3s) -- embedding quality may be low.")
 
         emb = extract_embedding(audio, classifier, device)
 
@@ -140,10 +140,10 @@ def main():
             print(f"   Similarity with previous embeddings: min={min_s:.2f}  max={max_s:.2f}")
             if min_s < args.min_sim:
                 low = [(f, s) for f, s in sims if s < args.min_sim]
-                print(f"   ⚠️  Low similarity with: {', '.join(f'{f}({s:.2f})' for f, s in low)}")
+                print(f"   WARNING: Low similarity with: {', '.join(f'{f}({s:.2f})' for f, s in low)}")
                 ans = input(f"   Save anyway? [y/N] ").strip().lower()
                 if ans not in ("s", "sim", "y", "yes"):
-                    print(f"   ⏭️  Skipped.")
+                    print(f"   Skipped.")
                     continue
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -151,22 +151,22 @@ def main():
         out_path = os.path.join(EMB_DIR, out_name)
         np.save(out_path, emb)
         saved.append(out_name)
-        print(f"   ✅ Saved: {out_name}")
+        print(f"   Saved: {out_name}")
 
     if saved:
         all_files = list_existing(args.name)
-        print(f"\n🎉 '{args.name}' now has {len(all_files)} embedding(s) total.")
+        print(f"\n'{args.name}' now has {len(all_files)} embedding(s) total.")
         if len(all_files) >= 2:
             # Show the resulting average (what the verifier will use)
             all_embs = [np.load(os.path.join(EMB_DIR, f)) for f in all_files]
             avg = np.mean(all_embs, axis=0)
             avg /= (np.linalg.norm(avg) + 1e-8)
             sims = [cosine_sim(avg, e) for e in all_embs]
-            print(f"   Average coherence (avg sim → centroid): {np.mean(sims):.2f}")
+            print(f"   Average coherence (avg sim -> centroid): {np.mean(sims):.2f}")
     else:
-        print("\n⚠️  No embedding saved.")
+        print("\nNo embedding saved.")
 
-    print(f"\n💡 Tip: restart the tracker to load the new embeddings.")
+    print(f"\nTip: restart the tracker to load the new embeddings.")
 
 
 if __name__ == "__main__":
