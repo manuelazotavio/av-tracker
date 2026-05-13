@@ -167,6 +167,8 @@ class RealtimeTranscriber:
         self.running = False
         self.recording_thread = None
         self.audio_buffer = deque(maxlen=int(sample_rate * chunk_duration * 2))
+        # Rolling buffer of (t_start, audio_float32) chunks for Light-ASD sync
+        self.shared_state.setdefault("asd_audio_buf", deque(maxlen=50))
         self.processing_buffer = []
         self.speaker_history = {}
         self.full_transcript = []
@@ -331,6 +333,10 @@ class RealtimeTranscriber:
                         audio_data = resampler(torch.from_numpy(audio_data)).numpy()
                     self.all_audio_chunks.append(audio_data.copy())
                     self.audio_queue.put(audio_data)
+                    # Feed Light-ASD rolling buffer with timestamps
+                    self.shared_state["asd_audio_buf"].append(
+                        (time.time() - len(audio_data) / target_sr, audio_data.copy())
+                    )
         except Exception:
             self.running = False
 
@@ -344,6 +350,9 @@ class RealtimeTranscriber:
                 audio_data = np.frombuffer(data, dtype=np.float32)
                 self.all_audio_chunks.append(audio_data.copy())
                 self.audio_queue.put(audio_data)
+                self.shared_state["asd_audio_buf"].append(
+                    (time.time() - len(audio_data) / self.sample_rate, audio_data.copy())
+                )
             stream.stop_stream()
             stream.close()
             p.terminate()

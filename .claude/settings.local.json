@@ -1,7 +1,22 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python download.py:*)"
+      "Bash(python download.py:*)",
+      "Bash(ls c:/Users/manu/av-tracker/realtime_sessions/*.txt)",
+      "Bash(ls c:/Users/manu/av-tracker/realtime_sessions/log_*)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Read(//c/Users/manu/av-tracker/**)",
+      "Bash(wc -l c:/Users/manu/av-tracker/*.py)",
+      "Bash(do basename:*)",
+      "Bash(rm -f src/2actors_transcricao.txt src/3actors_transcricao.txt src/4actors_transcricao.txt src/5actors_transcricao.txt src/analyze_metrics.py src/batch_process_multi_speaker.py src/calculate_metrics.py src/check_embeddings.py src/create_embeddings_from_audio.py \"src/debug_0.2_SPEAKER_00.wav\" \"src/debug_1.5_SPEAKER_01.wav\" \"src/debug_6.3_SPEAKER_01.wav\" src/debug_voz1.wav src/debug_voz2.wav src/download.py src/embedding_visualization.py src/enroll_actors.py src/enroll_actors_from_folders.py src/generate_custom_tsne.py src/mix_2_speakers_001_transcricao.txt src/test_metrics_quick.py src/teste.py src/top_n_analysis.py src/transcribe_multispeaker.py src/transcricao_final.txt src/visualize_embeddings_from_pkl.py)",
+      "Bash(rm -rf src/pretrained_models/)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''src/realtime_transcriber.py'', doraise=True\\)\")",
+      "Bash(where python:*)",
+      "Bash(ls c:/Users/manu/av-tracker/realtime_sessions/metrics_*.json)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\manu\\av-tracker\\data\\face_embeddings"
     ]
   }
 }

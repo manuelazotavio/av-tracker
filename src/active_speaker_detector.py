@@ -1,11 +1,12 @@
 """
-Active Speaker Detection (ASD) based on lip movement.
+Active Speaker Detection (ASD).
 
-For each tracked face, computes pixel difference in the mouth region
-between consecutive frames. The speaker with the highest average activity
-during the audio segment is the active speaker candidate.
+Primary backend: Light-ASD (Liao et al., CVPR 2023) — audio-visual neural model.
+Fallback backend: pixel-diff on mouth region (no model, always available).
 
-No additional models — uses only the already-processed camera frames.
+The pixel-diff backend is always kept running for get_active_speaker() /
+get_best_guess() queries from the audio thread (retrospective window).
+Light-ASD drives is_speaking_now() for the real-time display box.
 """
 
 import time
@@ -19,34 +20,52 @@ logger = logging.getLogger(__name__)
 
 class ActiveSpeakerDetector:
     # Mouth region: 60-100% vertical, 15-85% horizontal of the face bbox
-    MOUTH_TOP_RATIO  = 0.60
+    MOUTH_TOP_RATIO   = 0.60
     MOUTH_SIDE_MARGIN = 0.15
+    # Upper face region (forehead + eyes): used as motion baseline to detect occlusion.
+    # If the mouth region moves no more than OCCLUSION_RATIO × upper face, it's not speech.
+    UPPER_BOTTOM_RATIO = 0.50   # 0-50% vertical = forehead/eyes
+    OCCLUSION_RATIO    = 1.8    # mouth must be 1.8× more active than upper face to count
 
     def __init__(self, buffer_seconds: float = 15.0, min_frames: int = 2,
-                 dominant_ratio: float = 1.4):
-        """
-        Args:
-            buffer_seconds: history window kept in memory.
-            min_frames: minimum number of frames with data to consider a speaker.
-            dominant_ratio: minimum ratio between the best and second score to
-                            confirm the active speaker (avoids ties).
-        """
-        self._prev_mouth: dict[int, np.ndarray] = {}   # track_id → previous ROI
-        self._activity:   dict[int, deque]        = {}  # track_id → deque[(t, score)]
+                 dominant_ratio: float = 1.4, light_asd_model_path: str | None = None,
+                 device: str = "cuda"):
+        self._prev_mouth:  dict[int, np.ndarray] = {}
+        self._prev_upper:  dict[int, np.ndarray] = {}
+        self._activity:    dict[int, deque]       = {}
         self._buffer_seconds = buffer_seconds
         self._min_frames     = min_frames
         self._dominant_ratio = dominant_ratio
 
+        # Pixel-diff hysteresis (fallback when Light-ASD is unavailable)
+        self.SPEAK_ON_FLOOR  = 3.0
+        self.SPEAK_ON_SEC    = 0.35
+        self.SPEAK_OFF_SEC   = 0.6
+        self._speak_state: dict[int, bool]  = {}
+        self._speak_since: dict[int, float] = {}
+
+        # Light-ASD neural backend (optional)
+        self._light_asd = None
+        if light_asd_model_path:
+            try:
+                from src.light_asd_detector import LightASDDetector
+                self._light_asd = LightASDDetector(light_asd_model_path, device=device)
+                logger.info("LightASD backend active")
+            except Exception as e:
+                logger.warning(f"LightASD unavailable, falling back to pixel-diff: {e}")
+
     # ------------------------------------------------------------------
     # Per-frame update
     # ------------------------------------------------------------------
-    def update(self, frame: np.ndarray, face_results: list, timestamp: float | None = None) -> None:
+    def update(self, frame: np.ndarray, face_results: list,
+               timestamp: float | None = None, audio_buf=None) -> None:
         """Called every frame with the face tracker results.
 
         Args:
-            frame: BGR or grayscale camera frame.
+            frame:        BGR camera frame.
             face_results: list of dicts with 'track_id' and 'bbox' (x1,y1,x2,y2).
-            timestamp: epoch in seconds (default: time.time()).
+            timestamp:    epoch in seconds (default: time.time()).
+            audio_buf:    shared_state["asd_audio_buf"] deque — needed by Light-ASD.
         """
         if timestamp is None:
             timestamp = time.time()
@@ -66,20 +85,39 @@ class ActiveSpeakerDetector:
             mx1 = x1 + int(w * self.MOUTH_SIDE_MARGIN)
             mx2 = x2 - int(w * self.MOUTH_SIDE_MARGIN)
 
+            # Upper face region used as motion baseline (forehead/eyes)
+            uy1 = y1
+            uy2 = y1 + int(h * self.UPPER_BOTTOM_RATIO)
+
             mouth = gray[my1:my2, mx1:mx2]
+            upper = gray[uy1:uy2, mx1:mx2]
             if mouth.size == 0:
                 continue
 
             current_ids.add(track_id)
 
             # Pixel difference relative to previous frame
-            prev = self._prev_mouth.get(track_id)
-            if prev is not None and prev.shape == mouth.shape:
-                diff = float(np.mean(np.abs(mouth.astype(np.float32) - prev.astype(np.float32))))
+            prev_mouth = self._prev_mouth.get(track_id)
+            prev_upper = self._prev_upper.get(track_id)
+            if prev_mouth is not None and prev_mouth.shape == mouth.shape:
+                mouth_diff = float(np.mean(np.abs(mouth.astype(np.float32) - prev_mouth.astype(np.float32))))
             else:
+                mouth_diff = 0.0
+
+            if prev_upper is not None and prev_upper.shape == upper.shape and upper.size > 0:
+                upper_diff = float(np.mean(np.abs(upper.astype(np.float32) - prev_upper.astype(np.float32))))
+            else:
+                upper_diff = 0.0
+
+            # Reject occlusion: hand/object covering mouth moves entire face region similarly.
+            # Only count mouth activity when it's significantly higher than upper-face motion.
+            if mouth_diff > 0 and mouth_diff < self.OCCLUSION_RATIO * (upper_diff + 0.5):
                 diff = 0.0
+            else:
+                diff = mouth_diff
 
             self._prev_mouth[track_id] = mouth.copy()
+            self._prev_upper[track_id] = upper.copy() if upper.size > 0 else upper
 
             if track_id not in self._activity:
                 self._activity[track_id] = deque()
@@ -95,6 +133,11 @@ class ActiveSpeakerDetector:
         for tid in list(self._prev_mouth):
             if tid not in current_ids:
                 del self._prev_mouth[tid]
+                self._prev_upper.pop(tid, None)
+
+        # Light-ASD update (audio-visual neural backend)
+        if self._light_asd is not None:
+            self._light_asd.update(frame, face_results, timestamp, audio_buf)
 
     # ------------------------------------------------------------------
     # Query: who was speaking during [time_start, time_end]?
@@ -181,6 +224,41 @@ class ActiveSpeakerDetector:
 
         logger.debug(f"ASD_GUESS -> t{best_id} ({best_score:.1f}, below noise but dominant)")
         return best_id
+
+    def is_speaking_now(self, track_id: int) -> bool:
+        """Real-time check: delegates to Light-ASD if available, else pixel-diff hysteresis."""
+        if self._light_asd is not None:
+            return self._light_asd.is_speaking_now(track_id)
+        # -- pixel-diff fallback --
+        buf = self._activity.get(track_id)
+        now = time.time()
+
+        currently_speaking = self._speak_state.get(track_id, False)
+
+        if not buf:
+            if currently_speaking:
+                self._speak_state[track_id] = False
+                self._speak_since[track_id] = now
+            return False
+
+        if currently_speaking:
+            # Check if we should turn OFF: need SPEAK_OFF_SEC below NOISE_FLOOR
+            window = [s for t, s in buf if t >= now - self.SPEAK_OFF_SEC]
+            below_floor = len(window) >= self._min_frames and float(np.mean(window)) < self.NOISE_FLOOR
+            if below_floor:
+                self._speak_state[track_id] = False
+                self._speak_since[track_id] = now
+                return False
+            return True
+        else:
+            # Check if we should turn ON: need SPEAK_ON_SEC above SPEAK_ON_FLOOR
+            window = [s for t, s in buf if t >= now - self.SPEAK_ON_SEC]
+            above_floor = len(window) >= self._min_frames and float(np.mean(window)) >= self.SPEAK_ON_FLOOR
+            if above_floor:
+                self._speak_state[track_id] = True
+                self._speak_since[track_id] = now
+                return True
+            return False
 
     def get_scores(self, time_start: float, time_end: float) -> dict[int, float]:
         """Returns activity scores for all faces (for debug)."""

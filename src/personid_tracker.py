@@ -25,10 +25,12 @@ class _EdgeFaceXXS(nn.Module):
 
 
 class PersonIDTracker:
-    MATCH_THRESHOLD = 0.55  # cosine similarity to consider a known person
+    MATCH_THRESHOLD = 0.65  # cosine similarity to consider a known person
     MERGE_THRESHOLD = 0.55  # threshold for merging during auto-enrollment (same as MATCH)
-    ENROLL_FRAMES = 50      # frames to accumulate (~5s) for more stable average embedding
-    CONFIRM_FRAMES = 10     # consecutive frames needed to confirm a known-name assignment
+    ENROLL_FRAMES = 40      # min frames before checking enrollment (~2-3s at 15fps)
+    ENROLL_MAX_FRAMES = 120 # enroll regardless of diversity after this many frames (~8s at 15fps)
+    ENROLL_MIN_DIVERSITY = 0.05  # min avg pairwise cosine distance — ensures varied angles
+    CONFIRM_FRAMES = 5      # consecutive frames needed to confirm a known-name assignment
 
     def __init__(self, model_path="od_model/edgeface_xxs.pt", device="cuda"):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
@@ -150,6 +152,17 @@ class PersonIDTracker:
         for name in merged_into:
             self.known_embeddings.pop(name, None)
             self._emb_files.pop(name, None)
+
+    @staticmethod
+    def _buffer_diversity(embeddings):
+        """Mean pairwise cosine distance among buffered embeddings (0=identical, 2=opposite)."""
+        if len(embeddings) < 2:
+            return 0.0
+        embs = np.stack(embeddings)  # (N, 512) — already L2-normalised
+        sim = embs @ embs.T          # cosine similarity matrix
+        n = len(embeddings)
+        avg_sim = (sim.sum() - n) / (n * (n - 1))  # exclude diagonal (self-similarity=1)
+        return float(1.0 - avg_sim)
 
     def _extract_face_embedding(self, face_img):
         face_img = cv2.resize(face_img, (112, 112))
@@ -537,11 +550,20 @@ class PersonIDTracker:
                 # Buffer for auto-enrollment
                 buf = self._track_buffer.setdefault(track_id, [])
                 buf.append(current_emb)
-                if len(buf) >= self.ENROLL_FRAMES:
-                    best_name = self._enroll(track_id, buf)
-                    best_score = 1.0
-                    del self._track_buffer[track_id]
-                    claimed_this_frame[best_name] = track_id
+                n_buf = len(buf)
+                if n_buf >= self.ENROLL_FRAMES:
+                    diversity = PersonIDTracker._buffer_diversity(buf)
+                    diverse_enough = diversity >= self.ENROLL_MIN_DIVERSITY
+                    forced = n_buf >= self.ENROLL_MAX_FRAMES
+                    if diverse_enough or forced:
+                        logger.debug(
+                            f"👤 Enroll trigger track={int(track_id)}: "
+                            f"frames={n_buf} diversity={diversity:.4f} forced={forced}"
+                        )
+                        best_name = self._enroll(track_id, buf)
+                        best_score = 1.0
+                        del self._track_buffer[track_id]
+                        claimed_this_frame[best_name] = track_id
 
             results.append({
                 "track_id": track_id,

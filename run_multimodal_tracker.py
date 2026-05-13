@@ -76,8 +76,12 @@ class MultimodalFusion:
         # Expose the tracker in shared_state so the transcriber can rename face embeddings
         self.shared_state["face_tracker"] = self.tracker
 
-        # Active Speaker Detection — detects lip movement per face
-        self.asd = ActiveSpeakerDetector()
+        # Active Speaker Detection — Light-ASD (audio-visual) with pixel-diff fallback
+        _light_asd_path = "pretrained_models/Light-ASD-repo/weight/pretrain_AVA_CVPR.model"
+        self.asd = ActiveSpeakerDetector(
+            light_asd_model_path=_light_asd_path,
+            device=self.device,
+        )
         self.shared_state["asd"] = self.asd
 
     def _feed_file_audio(self, video_file: str):
@@ -248,18 +252,25 @@ class MultimodalFusion:
                 if not _generic_re.match(display_name_check) and display_name_check != "Unknown":
                     used_names_this_frame[display_name_check] = track_id
 
-                display_name = person_names.get(person_id, face_name)
+            # Update ASD before drawing so is_speaking_now() reflects the current frame
+            _t0 = time.perf_counter()
+            self.asd.update(frame, results, time.time(),
+                            self.shared_state.get("asd_audio_buf"))
+            _vlog("asd_update", (time.perf_counter() - _t0) * 1000)
+            self.shared_state["active_faces"] = current_faces
+
+            # Draw boxes only for faces that are currently speaking
+            for res in results:
+                track_id = res['track_id']
+                if not self.asd.is_speaking_now(track_id):
+                    continue
+                person_id = current_faces.get(track_id)
+                display_name = person_names.get(person_id, res['name']) if person_id else res['name']
                 x1, y1, x2, y2 = res['bbox']
                 label = f"{display_name} ({res['confidence']:.2f})"
                 color = (0, 255, 0) if not _generic_re.match(display_name) else (0, 0, 255)
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                 cv2.putText(frame, label, (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-            # Update ASD with all faces from the current frame (outside the loop to pass the full list)
-            _t0 = time.perf_counter()
-            self.asd.update(frame, results, time.time())
-            _vlog("asd_update", (time.perf_counter() - _t0) * 1000)
-            self.shared_state["active_faces"] = current_faces
 
             _vlog("frame_total", (time.perf_counter() - _t0_frame) * 1000)
             _vframe_count += 1
