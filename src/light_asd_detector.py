@@ -178,7 +178,16 @@ class LightASDDetector:
     WINDOW_SEC     = 1.0    # temporal context per inference call
     AUDIO_FPS      = 100    # MFCC frames per second (10ms hop)
     VIDEO_FPS      = 25     # model training FPS — crops are interpolated to this
-    INFER_INTERVAL = 0.30   # seconds between inference runs per track
+    INFER_INTERVAL = 0.60   # seconds between inference runs per track (GPU budget)
+    # Per-frame speaking scores are retained this long so the audio thread can
+    # query them retrospectively (diarization chunks lag several seconds).
+    SCORE_RETENTION_SEC = 20.0
+
+    # Retrospective query thresholds (get_active_speaker)
+    QUERY_MIN_SCORE   = 0.50   # mean score required to count as the speaker
+    QUERY_MARGIN      = 0.15   # best must beat second by this to avoid ties
+    GUESS_MIN_SCORE   = 0.30   # relaxed threshold for get_best_guess fallback
+    GUESS_MARGIN      = 0.10
 
     # Hysteresis (same semantics as the pixel-diff version)
     SPEAK_ON_THRESH  = 0.55   # model score to START showing box
@@ -236,14 +245,24 @@ class LightASDDetector:
                 if timestamp - last >= self.INFER_INTERVAL:
                     self._run_inference(tid, timestamp, audio_buf)
 
-        # Clean up gone tracks
+        # Drop per-track working state for tracks that left the frame.
+        # _score_buf is intentionally KEPT — the audio thread queries it
+        # retrospectively (see get_active_speaker).
         for tid in list(self._crop_buf):
             if tid not in current_ids:
                 self._crop_buf.pop(tid, None)
-                self._score_buf.pop(tid, None)
                 self._last_infer.pop(tid, None)
                 self._speak_state.pop(tid, None)
                 self._speak_since.pop(tid, None)
+
+        # Time-trim score history for all tracks (live or vanished)
+        cutoff = timestamp - self.SCORE_RETENTION_SEC
+        for tid in list(self._score_buf):
+            sbuf = self._score_buf[tid]
+            while sbuf and sbuf[0][0] < cutoff:
+                sbuf.popleft()
+            if not sbuf:
+                del self._score_buf[tid]
 
     # ------------------------------------------------------------------
     # Hysteresis query
@@ -283,6 +302,49 @@ class LightASDDetector:
         now = time.time()
         recent = [s for t, s in sbuf if t >= now - self.INFER_INTERVAL * 2]
         return float(np.mean(recent)) if recent else 0.0
+
+    # ------------------------------------------------------------------
+    # Retrospective query — used by the audio thread for speaker attribution
+    # ------------------------------------------------------------------
+
+    def has_scores(self, time_start: float, time_end: float) -> bool:
+        """True if any track has Light-ASD scores within the window."""
+        for sbuf in self._score_buf.values():
+            if any(time_start <= t <= time_end for t, _ in sbuf):
+                return True
+        return False
+
+    def get_active_speaker(self, time_start: float, time_end: float,
+                           min_score: float | None = None,
+                           margin: float | None = None) -> int | None:
+        """Return the track_id of the dominant speaker in [time_start, time_end].
+
+        Uses the per-frame neural speaking probabilities. Returns None when no
+        face is clearly speaking or two faces are too close to call.
+        """
+        min_score = self.QUERY_MIN_SCORE if min_score is None else min_score
+        margin    = self.QUERY_MARGIN    if margin    is None else margin
+
+        scores: dict[int, float] = {}
+        for tid, sbuf in self._score_buf.items():
+            window = [s for t, s in sbuf if time_start <= t <= time_end]
+            if len(window) >= 2:
+                scores[tid] = float(np.mean(window))
+        if not scores:
+            return None
+
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        best_id, best = ranked[0]
+        scores_str = " | ".join(f"t{t}:{s:.2f}" for t, s in ranked)
+        logger.debug(f"LightASD query [{time_end - time_start:.2f}s]: {scores_str}")
+
+        if best < min_score:
+            return None
+        if len(ranked) == 1:
+            return best_id
+        if best - ranked[1][1] < margin:
+            return None  # ambiguous — two faces with similar scores
+        return best_id
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -356,14 +418,15 @@ class LightASDDetector:
                 eA = self.model.forward_audio_frontend(inputA)
                 out = self.model.forward_audio_visual_backend(eA, eV)
                 scores = F.softmax(self.fc(out), dim=-1)[:, 1].cpu().numpy()
-            # Store one score per video frame, keyed by estimated frame time
+            # Store one score per video frame, keyed by estimated frame time.
+            # Consecutive 1s windows overlap (run every INFER_INTERVAL) — only
+            # append frames newer than what's already stored to avoid duplicates.
             sbuf = self._score_buf.setdefault(track_id, deque())
+            last_t = sbuf[-1][0] if sbuf else -1.0
             for i, s in enumerate(scores):
                 t_frame = t_start + (i / T_v) * self.WINDOW_SEC
-                sbuf.append((t_frame, float(s)))
-            cutoff = now - self.WINDOW_SEC * 2
-            while sbuf and sbuf[0][0] < cutoff:
-                sbuf.popleft()
+                if t_frame > last_t:
+                    sbuf.append((t_frame, float(s)))
             logger.debug(f"LightASD track={track_id} mean={np.mean(scores):.2f}")
         except Exception as e:
             logger.debug(f"LightASD inference error: {e}")

@@ -4,9 +4,10 @@ Active Speaker Detection (ASD).
 Primary backend: Light-ASD (Liao et al., CVPR 2023) — audio-visual neural model.
 Fallback backend: pixel-diff on mouth region (no model, always available).
 
-The pixel-diff backend is always kept running for get_active_speaker() /
-get_best_guess() queries from the audio thread (retrospective window).
-Light-ASD drives is_speaking_now() for the real-time display box.
+get_active_speaker() / get_best_guess() — used by the audio thread to attribute
+a speech segment to a face — prefer Light-ASD's neural scores and fall back to
+pixel-diff only when Light-ASD has no data for the requested window.
+The pixel-diff backend keeps running every frame so the fallback always works.
 """
 
 import time
@@ -150,10 +151,16 @@ class ActiveSpeakerDetector:
     def get_active_speaker(self, time_start: float, time_end: float) -> int | None:
         """Returns track_id of the most active speaker in the window, or None if uncertain.
 
+        Prefers the Light-ASD neural backend; falls back to pixel-diff only when
+        Light-ASD has no score data covering the requested window.
+
         Args:
             time_start: start of the audio segment (epoch seconds).
             time_end:   end of the audio segment (epoch seconds).
         """
+        if self._light_asd is not None and self._light_asd.has_scores(time_start, time_end):
+            return self._light_asd.get_active_speaker(time_start, time_end)
+        # -- pixel-diff fallback --
         scores: dict[int, float] = {}
         for track_id, buf in self._activity.items():
             window = [s for t, s in buf if time_start <= t <= time_end]
@@ -198,6 +205,13 @@ class ActiveSpeakerDetector:
         Used when the verifier has no match and get_active_speaker() returned None.
         Only returns when the best face has score > 0 AND is clearly dominant (2x second).
         """
+        if self._light_asd is not None and self._light_asd.has_scores(time_start, time_end):
+            return self._light_asd.get_active_speaker(
+                time_start, time_end,
+                min_score=self._light_asd.GUESS_MIN_SCORE,
+                margin=self._light_asd.GUESS_MARGIN,
+            )
+        # -- pixel-diff fallback --
         scores: dict[int, float] = {}
         for track_id, buf in self._activity.items():
             window = [s for t, s in buf if time_start <= t <= time_end]

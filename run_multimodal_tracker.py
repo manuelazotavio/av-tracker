@@ -22,10 +22,35 @@ try:
 except ImportError:
     _LIBROSA_AVAILABLE = False
 
+from PIL import Image, ImageDraw, ImageFont
+
+_LABEL_FONT = None
+def _get_label_font():
+    """Cached TrueType font — OpenCV's Hershey fonts can't render accents."""
+    global _LABEL_FONT
+    if _LABEL_FONT is None:
+        try:
+            _LABEL_FONT = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 18)
+        except Exception:
+            _LABEL_FONT = ImageFont.load_default()
+    return _LABEL_FONT
+
+
+def _draw_labels_unicode(frame_bgr, labels):
+    """Draw accented text labels via PIL. labels = list of (text, x, y, bgr_color)."""
+    img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img)
+    font = _get_label_font()
+    for text, x, y, (b, g, r) in labels:
+        draw.text((x, y), text, font=font, fill=(r, g, b))
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
 class MultimodalFusion:
-    def __init__(self, hf_token, device="cuda", num_speakers=None, audio_device=None, video_file=None, screen_region=None, headless=False):
+    def __init__(self, hf_token, device="cuda", num_speakers=None, audio_device=None, video_file=None, screen_region=None, headless=False, render_out=None):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
         self.video_file = video_file  # None → real-time webcam
+        self.render_out = render_out  # path → offline render mode (annotated video, no live display)
         self.screen_region = screen_region  # dict for mss screen capture (meeting mode)
         self.num_speakers = num_speakers  # limits tracked faces by area
         self.headless = headless  # True = no interactive prompts (launched from GUI)
@@ -61,16 +86,18 @@ class MultimodalFusion:
             self.verifier,
             hf_token,
             device=self.device,
-            whisper_size="large-v3-turbo",
-            use_ai_analysis=True,
+            whisper_size="medium",
+            use_ai_analysis=False,  # HF inference endpoint dead; NER handles names locally
             verifier_confidence_min=0.70,
             shared_state=self.shared_state,
             num_speakers=num_speakers,
             audio_device=audio_device,
+            language="en",  # "pt" for PT-BR; "en" for AMI corpus testing
         )
 
         self.detector = YOLOFaceDetector(model_path="od_model/yolov8n-face.pt", device=self.device)
-        self.tracker = PersonIDTracker(model_path="od_model/edgeface_xxs.pt", device=self.device)
+        self.tracker = PersonIDTracker(model_path="od_model/edgeface_xxs.pt", device=self.device,
+                                       max_identities=self.num_speakers)
         self.tracker.load_known_embeddings(face_emb_dir)
 
         # Expose the tracker in shared_state so the transcriber can rename face embeddings
@@ -177,6 +204,28 @@ class MultimodalFusion:
         _frame_interval = 1.0 / _target_fps
         _last_frame_time = 0.0
 
+        # Offline render mode: write an annotated video file instead of a live
+        # display. Removes the real-time stutter caused by GPU contention —
+        # every processed frame becomes one frame in a smooth output video.
+        _render = self.render_out is not None and self.video_file is not None
+        _writer = None
+        _render_temp = None
+        if _render:
+            _src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            _w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            _h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            _render_fps = 10
+            _sample_stride = _src_fps / _render_fps   # source frames per output frame
+            _src_frame_idx = 0
+            _next_sample = 0.0
+            _render_start = time.perf_counter()
+            _render_temp = os.path.splitext(self.render_out)[0] + "_temp.mp4"
+            _writer = cv2.VideoWriter(_render_temp, cv2.VideoWriter_fourcc(*"mp4v"),
+                                      _render_fps, (_w, _h))
+            if not _writer.isOpened():
+                print("⚠ Could not open VideoWriter — render output may be empty.")
+            print(f"🎞  Offline render mode → {self.render_out}")
+
         while (sct is not None) or (cap is not None and cap.isOpened()):
             if sct:
                 img = np.array(sct.grab(self.screen_region))
@@ -185,11 +234,19 @@ class MultimodalFusion:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                # Skip frames to match target FPS (reduces GPU load)
-                now = time.perf_counter()
-                if now - _last_frame_time < _frame_interval:
-                    continue
-                _last_frame_time = now
+                if _render:
+                    # Sample source frames at the render FPS (source-time based,
+                    # not wall-clock — so no frames are dropped under GPU load).
+                    _src_frame_idx += 1
+                    if _src_frame_idx < _next_sample:
+                        continue
+                    _next_sample += _sample_stride
+                else:
+                    # Skip frames to match target FPS (reduces GPU load)
+                    now = time.perf_counter()
+                    if now - _last_frame_time < _frame_interval:
+                        continue
+                    _last_frame_time = now
 
             _t0_frame = time.perf_counter()
 
@@ -252,52 +309,85 @@ class MultimodalFusion:
                 if not _generic_re.match(display_name_check) and display_name_check != "Unknown":
                     used_names_this_frame[display_name_check] = track_id
 
-            # Update ASD before drawing so is_speaking_now() reflects the current frame
+            # Update ASD (used for audio-side speaker attribution)
             _t0 = time.perf_counter()
             self.asd.update(frame, results, time.time(),
                             self.shared_state.get("asd_audio_buf"))
             _vlog("asd_update", (time.perf_counter() - _t0) * 1000)
             self.shared_state["active_faces"] = current_faces
 
-            # Draw boxes only for faces that are currently speaking
+            # Draw a box for every tracked face. Rectangles via cv2; text via PIL
+            # (cv2.putText cannot render accents — "Vinícius" → "Vin??cius").
+            _labels = []
             for res in results:
                 track_id = res['track_id']
-                if not self.asd.is_speaking_now(track_id):
-                    continue
                 person_id = current_faces.get(track_id)
                 display_name = person_names.get(person_id, res['name']) if person_id else res['name']
                 x1, y1, x2, y2 = res['bbox']
                 label = f"{display_name} ({res['confidence']:.2f})"
                 color = (0, 255, 0) if not _generic_re.match(display_name) else (0, 0, 255)
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                cv2.putText(frame, label, (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                _labels.append((label, int(x1), int(y1) - 24, color))
+            if _labels:
+                frame = _draw_labels_unicode(frame, _labels)
 
             _vlog("frame_total", (time.perf_counter() - _t0_frame) * 1000)
             _vframe_count += 1
             if _vframe_count % _VPERF_INTERVAL == 0:
                 _vprint_summary()
 
-            h, w = frame.shape[:2]
-            max_w, max_h = 1280, 720
-            scale = min(max_w / w, max_h / h, 1.0)
-            if scale < 1.0:
-                display = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            if _render:
+                _writer.write(frame)
+                # Cap at 1x source-time so the audio thread (fed in simulated
+                # real-time) stays in sync. If the GPU can't keep up, the render
+                # simply runs slower than 1x — the output stays smooth because
+                # every processed frame is exactly one frame in the output.
+                _src_elapsed = _src_frame_idx / _src_fps
+                _wall_elapsed = time.perf_counter() - _render_start
+                if _wall_elapsed < _src_elapsed:
+                    time.sleep(_src_elapsed - _wall_elapsed)
+                if _vframe_count % 100 == 0:
+                    print(f"  🎞  render: {_src_elapsed:6.1f}s of source processed")
             else:
-                display = frame
-            cv2.imshow("AV-Tracker Multimodal", display)
-            # In file mode, wait longer to sync with audio feed (~100ms)
-            wait_ms = 1 if not self.video_file else 100
-            if cv2.waitKey(wait_ms) & 0xFF == ord('q'):
-                break
+                h, w = frame.shape[:2]
+                max_w, max_h = 1280, 720
+                scale = min(max_w / w, max_h / h, 1.0)
+                display = cv2.resize(frame, (int(w * scale), int(h * scale))) if scale < 1.0 else frame
+                cv2.imshow("AV-Tracker Multimodal", display)
+                # In file mode, wait longer to sync with audio feed (~100ms)
+                wait_ms = 1 if not self.video_file else 100
+                if cv2.waitKey(wait_ms) & 0xFF == ord('q'):
+                    break
             # Periodically free GPU cache to prevent OOM
             if self.video_file and _vframe_count % 50 == 0 and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if _writer is not None:
+            _writer.release()
         if cap:
             cap.release()
         if sct:
             sct.close()
-        cv2.destroyAllWindows()
+        if not _render:
+            cv2.destroyAllWindows()
+        if _render:
+            self._mux_render_audio(_render_temp)
+
+    def _mux_render_audio(self, temp_video):
+        """Mux the original video's audio into the rendered (video-only) output."""
+        import subprocess
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", temp_video, "-i", self.video_file,
+                 "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac",
+                 "-shortest", self.render_out],
+                check=True, capture_output=True,
+            )
+            if os.path.exists(temp_video):
+                os.remove(temp_video)
+            print(f"\n✅ Annotated video saved: {self.render_out}")
+        except Exception as e:
+            print(f"\n⚠ Audio mux failed ({e}). Video-only output kept: {temp_video}")
 
     def run(self):
         if self.video_file:
@@ -381,6 +471,7 @@ def _parse_args():
     parser.add_argument("--meeting", action="store_true", help="Meeting mode (screen capture)")
     parser.add_argument("--monitor", type=int, default=1, help="Monitor index for meeting mode")
     parser.add_argument("--headless", action="store_true", help="No interactive prompts (for GUI launch)")
+    parser.add_argument("--render", action="store_true", help="Offline render: write an annotated video file instead of live display (requires --video)")
     args, _ = parser.parse_known_args()
     return args
 
@@ -474,7 +565,17 @@ if __name__ == "__main__":
         print("No speaker limit")
         num_speakers = None
 
+    # Offline render mode (requires a video file)
+    render_out = None
+    if args.render:
+        if video_file:
+            render_out = os.path.splitext(video_file)[0] + "_annotated.mp4"
+        else:
+            print("⚠ --render requires --video; ignoring --render.")
+
     setup_session_logging()
     app = MultimodalFusion(HF_TOKEN, num_speakers=num_speakers, audio_device=audio_device,
-                           video_file=video_file, screen_region=screen_region, headless=args.headless)
+                           video_file=video_file, screen_region=screen_region,
+                           headless=args.headless or render_out is not None,
+                           render_out=render_out)
     app.run()

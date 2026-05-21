@@ -151,10 +151,11 @@ def _init_heavy_deps():
         raise
 
 class RealtimeTranscriber:
-    def __init__(self, verifier, hf_token, whisper_size="medium", device="cuda", use_ai_analysis=True, diarization_clustering_threshold=0.6, verifier_confidence_min=0.8, chunk_duration=2.0, sample_rate=16000, shared_state=None, num_speakers=None, audio_device=None):
+    def __init__(self, verifier, hf_token, whisper_size="medium", device="cuda", use_ai_analysis=True, diarization_clustering_threshold=0.6, verifier_confidence_min=0.8, chunk_duration=2.0, sample_rate=16000, shared_state=None, num_speakers=None, audio_device=None, language="pt"):
         _init_heavy_deps()
         self.verifier = verifier
         self.device = device
+        self.language = language  # Whisper transcription language ("pt", "en", ...)
         self.use_ai_analysis = use_ai_analysis
         self.diarization_clustering_threshold = diarization_clustering_threshold
         self.verifier_confidence_min = verifier_confidence_min
@@ -189,14 +190,21 @@ class RealtimeTranscriber:
             logger.info(f"Speaker limit: {num_speakers}")
         login(token=hf_token)
         self.llm = None  # not used
-        if use_ai_analysis:
-            try:
-                # sm (~50MB) does the same job as lg (~500MB) for name detection
-                self.nlp = spacy.load("pt_core_news_sm")
-            except OSError:
-                self.nlp = None
-        else:
-            self.nlp = None
+        # spaCy NER — local, fast, always loaded. Used to validate detected
+        # names so discourse markers ("Yeah,", "So,", "Well,") are not mistaken
+        # for vocatives. Model is chosen to match the transcription language.
+        self.nlp = None
+        if spacy is not None:
+            _spacy_model = "en_core_web_sm" if self.language == "en" else "pt_core_news_sm"
+            for _m in (_spacy_model, "pt_core_news_sm", "en_core_web_sm"):
+                try:
+                    self.nlp = spacy.load(_m)
+                    logger.info(f"spaCy NER model: {_m}")
+                    break
+                except OSError:
+                    continue
+            if self.nlp is None:
+                logger.warning("No spaCy model available — NER name validation disabled.")
         self.pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1").to(torch.device(device))
         if self.diarization_clustering_threshold is not None:
             try:
@@ -489,56 +497,46 @@ class RealtimeTranscriber:
                 # Fall through to diarization-based processing with ORIGINAL audio
 
             # --- Default diarization-based processing (1 speaker or SepFormer failed) ---
-            # Merge consecutive turns from the same speaker into a single segment
-            # to give Whisper more context (short <2s segments produce garbage).
-            spk_segments = defaultdict(list)
-            for turn, spk in turns:
-                start_s = int(turn.start * 16000)
-                end_s = min(int(turn.end * 16000), len(audio_np))
-                seg = audio_np[start_s:end_s]
-                if len(seg) >= int(16000 * 0.5):
-                    spk_segments[spk].append(seg)
-
-            # Use SepFormer session hints if available, otherwise compute from diarization.
-            # Pass audio_gender so that male/female speakers always get different session IDs.
-            if _sep_spk_to_session:
-                spk_to_session = _sep_spk_to_session
-            else:
-                spk_to_session = {}
-                for spk, segs in spk_segments.items():
-                    concat_audio = np.concatenate(segs)
-                    spk_gender = self._detect_gender_from_audio(concat_audio)
-                    spk_to_session[spk] = self._get_or_create_session_speaker_id(
-                        concat_audio, audio_gender=spk_gender
-                    )
-                # Remap session IDs that are already face-bound so that session_hint
-                # arrives as the unified face identity instead of a raw spk_N.
-                for spk in list(spk_to_session.keys()):
-                    sid = spk_to_session[spk]
-                    face_pid = self._session_to_face.get(sid)
-                    if face_pid and face_pid in self.speaker_names:
-                        spk_to_session[spk] = face_pid
-
-            # Group consecutive new-zone turns by speaker, keeping order
-            MIN_SEGMENT_S = 2.0
-            merged_groups = []  # list of (spk, start_sample, end_sample)
+            # Group consecutive turns into segments. Diarization sometimes labels
+            # two DIFFERENT people with the SAME label inside one chunk, so a
+            # matching label is not enough to merge — the actual voice (ECAPA
+            # cosine similarity) must also match. Otherwise one segment ends up
+            # containing two speakers and gets attributed to just one of them.
+            MIN_SEGMENT_S  = 2.0
+            SAME_VOICE_SIM = 0.40   # consecutive same-label turns merge only if voices match
+            merged_groups = []  # list of [spk, start_sample, end_sample, voice_emb]
             for turn, spk in turns:
                 start_s = int(turn.start * 16000)
                 end_s   = min(int(turn.end * 16000), len(audio_np))
                 seg_start = max(start_s, new_zone_start_samples)
                 if seg_start >= end_s:
                     continue
-                if merged_groups and merged_groups[-1][0] == spk:
-                    # Extend the previous group (same speaker, merge gap)
-                    merged_groups[-1] = (spk, merged_groups[-1][1], end_s)
+                turn_emb = self._voice_embedding(audio_np[seg_start:end_s])
+                _same_voice, _sim = True, 1.0
+                if merged_groups and merged_groups[-1][3] is not None and turn_emb is not None:
+                    _sim = float(np.dot(merged_groups[-1][3], turn_emb))
+                    _same_voice = _sim >= SAME_VOICE_SIM
+                if merged_groups and merged_groups[-1][0] == spk and _same_voice:
+                    # Same diarization label AND same voice — extend the group
+                    merged_groups[-1][2] = end_s
                 else:
-                    merged_groups.append((spk, seg_start, end_s))
+                    if merged_groups and merged_groups[-1][0] == spk and not _same_voice:
+                        logger.debug(f"Turn split: label '{spk}' kept but voice differs "
+                                     f"(sim={_sim:.2f} < {SAME_VOICE_SIM}) — separate speaker")
+                    merged_groups.append([spk, seg_start, end_s, turn_emb])
 
-            for spk, seg_start, seg_end in merged_groups:
+            for spk, seg_start, seg_end, _g_emb in merged_groups:
                 segment = audio_np[seg_start:seg_end]
                 seg_dur = len(segment) / 16000
                 if seg_dur < 0.5:
                     continue
+                # Session hint from this group's OWN single-voice audio — never
+                # from the diarization label, which may lump two speakers together.
+                _g_gender = self._detect_gender_from_audio(segment) if librosa is not None else None
+                _sid = self._get_or_create_session_speaker_id(segment, audio_gender=_g_gender)
+                _face_pid = self._session_to_face.get(_sid)
+                if _face_pid and _face_pid in self.speaker_names:
+                    _sid = _face_pid
                 # For very short segments (<2s), try to extend with surrounding audio
                 # to give Whisper enough context for decent transcription
                 if seg_dur < MIN_SEGMENT_S:
@@ -548,7 +546,7 @@ class RealtimeTranscriber:
                     segment = audio_np[seg_start - pad_before:seg_end + pad_after]
                 self._process_segment(
                     segment,
-                    session_hint=spk_to_session.get(spk),
+                    session_hint=_sid,
                     wall_time_start=chunk_wall_start + seg_start / 16000,
                     wall_time_end=chunk_wall_start + seg_end / 16000,
                 )
@@ -634,23 +632,36 @@ class RealtimeTranscriber:
             bad_phrases = ["Amara.org", "Legendas", "Obrigado", "tchau gente", "tchau tchau",
                            "transmissão", "inscreva-se", "obrigada por assistir",
                            "continue assistindo", "não se esqueça",
-                           "estou ouvindo", "i'm listening", "subtitles by"]
+                           "estou ouvindo", "i'm listening", "subtitles by",
+                           # Whisper YouTube-training hallucinations (PT-BR)
+                           "se inscreva", "inscreva no canal", "sininho", "ative o",
+                           "ative as notificações", "deixe seu like", "deixa o like",
+                           "curta o vídeo", "curtam o vídeo", "compartilhe", "comentários",
+                           "próximo vídeo", "valeu galera", "até a próxima",
+                           "nos vemos", "obrigado por assistir"]
             try:
                 _t0_whisper = time.perf_counter()
-                # Audio is already segmented by diarization (which includes VAD).
-                # Only apply Whisper VAD on longer segments (>10s) where internal
-                # silence removal helps; for short segments it destroys context.
-                _use_vad = len(audio_np) > 10 * 16000
+                # VAD always on: Silero strips non-speech so Whisper does not
+                # hallucinate YouTube phrases on silent/low-speech segments.
+                # speech_pad_ms keeps 300ms around real speech to preserve context.
+                _whisper_prompt = (
+                    "Transcrição de conversa em português brasileiro."
+                    if self.language == "pt"
+                    else "Transcript of a conversation."
+                )
                 segs_gen, _ = self.whisper.transcribe(
                     audio_np,
-                    language="pt",
+                    language=self.language,
                     beam_size=5,
-                    vad_filter=_use_vad,
+                    vad_filter=True,
                     vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 300},
                     condition_on_previous_text=False,
                     without_timestamps=False,
-                    # Portuguese prompt hint to guide Whisper toward PT-BR transcription style
-                    initial_prompt="Transcrição de conversa em português brasileiro.",
+                    compression_ratio_threshold=2.4,
+                    log_prob_threshold=-1.0,
+                    no_speech_threshold=0.6,
+                    # Prompt hint to guide Whisper toward the conversation style
+                    initial_prompt=_whisper_prompt,
                 )
                 segs_list = list(segs_gen)
                 _whisper_ms = (time.perf_counter() - _t0_whisper) * 1000
@@ -668,12 +679,33 @@ class RealtimeTranscriber:
             text = " ".join([s.text for s in segs_list]).strip()
             if not text or len(text) < 5 or any(bp.lower() in text.lower() for bp in bad_phrases):
                 return
+            # Prompt echo: Whisper regurgitates initial_prompt on low-speech audio
+            # ("Apesar de conversa em português brasileiro." etc.)
+            if SequenceMatcher(None, text.lower(), _whisper_prompt.lower()).ratio() > 0.6:
+                logger.debug(f"Discarded prompt-echo hallucination: {text!r}")
+                return
             # Detect hallucination by repetition: "X. X. X." or "X X X"
             _parts = [p.strip() for p in re.split(r"[.!?,;]+", text) if p.strip()]
             if len(_parts) >= 3 and len(set(p.lower() for p in _parts)) == 1:
                 return  # all fragments are identical -> hallucination
+            # Caption/subtitle artifacts that are hallucinations ONLY when they
+            # are the entire transcription. Matched against the whole text, so
+            # legit uses inside a sentence ("preste atenção") are not filtered.
+            _exact_halluc = {"atenção", "música", "legenda", "legendas", "aplausos",
+                             "risos", "obrigado", "obrigada", "fim", "the end"}
+            _text_norm = text.lower().strip(" .!?,;:\"'-[]()")
+            if _text_norm in _exact_halluc:
+                logger.debug(f"Discarded caption-artifact hallucination: {text!r}")
+                return
             # Short phrases with low logprob or moderate no_speech -> likely hallucination
             if len(text) < 20 and (avg_logprob < -0.8 or avg_no_speech > 0.3):
+                return
+            # Single short word with any elevated no-speech probability — a very
+            # common hallucination on silence/noise that VAD let through.
+            _words = _text_norm.split()
+            if len(_words) <= 1 and len(_text_norm) < 14 and avg_no_speech > 0.15:
+                logger.debug(f"Discarded single-word hallucination: {text!r} "
+                             f"(no_speech={avg_no_speech:.2f})")
                 return
 
             # Identify the speaker: verifier -> visual -> voice tracking
@@ -1428,6 +1460,19 @@ class RealtimeTranscriber:
         except Exception as e:
             logger.debug(f"Auto-enroll failed ({name}): {e}")
 
+    def _voice_embedding(self, audio_np):
+        """Normalized ECAPA voice embedding for a short segment; None if too short/failed."""
+        if audio_np is None or len(audio_np) < int(16000 * 0.4):
+            return None
+        try:
+            signal = torch.from_numpy(np.ascontiguousarray(audio_np)).float().to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                emb = self.classifier.encode_batch(signal).squeeze().cpu().numpy()
+            norm = np.linalg.norm(emb)
+            return emb / norm if norm > 0 else None
+        except Exception:
+            return None
+
     def _get_or_create_session_speaker_id(self, audio_np, exclude_ids=None, audio_gender=None):
         """Return stable session ID for unknown speaker using voice similarity.
 
@@ -1534,6 +1579,16 @@ class RealtimeTranscriber:
                 'onde', 'como', 'quando', 'quanto', 'vamos', 'bora',
                 'hein', 'né', 'pô', 'putz', 'caramba', 'caraca',
                 'maravilha', 'perfeito', 'exatamente', 'simplesmente',
+                # English discourse markers / fillers that Whisper capitalizes
+                # at sentence start — never person names.
+                'yeah', 'yep', 'yes', 'no', 'nope', 'ok', 'okay', 'so', 'well',
+                'right', 'now', 'look', 'hey', 'hi', 'hello', 'um', 'uh', 'hmm',
+                'oh', 'ah', 'anyway', 'alright', 'actually', 'basically', 'like',
+                'sure', 'maybe', 'please', 'thanks', 'thank', 'sorry', 'exactly',
+                'totally', 'honestly', 'obviously', 'listen', 'wait', 'and', 'but',
+                'or', 'because', 'then', 'also', 'just', 'really', 'here', 'there',
+                'this', 'that', 'what', 'who', 'when', 'where', 'why', 'how',
+                'which', 'guys', 'everyone', 'folks', 'man', 'dude', 'mean',
             }
             _blocklist = self._vocative_blocklist
 
@@ -1542,14 +1597,32 @@ class RealtimeTranscriber:
                     and n.lower() not in _blocklist
                     and not re.match(r'^(Person_\d+|spk_\d+)$', n))
 
+        # spaCy NER on the full sentence — collect words/entities tagged PERSON.
+        # The "word adjacent to a comma" rules below are weak ("Yeah, so I...") so
+        # the candidate must also be confirmed as a real person name by NER.
+        _ner_entities = self._extract_names_with_ner(text)
+        _ner_set = set()
+        for _e in _ner_entities:
+            _ner_set.add(_e.lower())
+            _ner_set.update(_e.lower().split())
+
+        def _is_person(n):
+            # NER must confirm the candidate. When NER is unavailable, don't
+            # block — fall back to the blocklist alone.
+            if self.nlp is None:
+                return True
+            nl = n.lower()
+            return nl in _ner_set or any(w in _ner_set for w in nl.split())
+
         # 1) Vocative at start: "Arthur, pode falar" / "Kauan, o que acha?"
+        #    NER-gated — rejects "Yeah,", "So,", "Well," and other discourse markers.
         m = re.match(r'^([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)\s*,', text)
-        if m and _valid_name(m.group(1)):
+        if m and _valid_name(m.group(1)) and _is_person(m.group(1)):
             results.append((m.group(1).title(), "addressee"))
 
         # 2) Vocative at end: "Pode falar, Arthur" / "Né, Kauan?"
         m = re.search(r',\s*([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)\s*[?.!]?\s*$', text)
-        if m and _valid_name(m.group(1)):
+        if m and _valid_name(m.group(1)) and _is_person(m.group(1)):
             results.append((m.group(1).title(), "addressee"))
 
         # 3) Invitation to speak: "Fala, Arthur" / "Vai lá, Manu" / "Pode falar, Kauan"
@@ -1569,10 +1642,9 @@ class RealtimeTranscriber:
                 if _valid_name(raw):
                     results.append((raw.title(), "mentioned"))
 
-        # 5) NER fallback: extract any PER entity not already found
-        ner_names = self._extract_names_with_ner(text)
+        # 5) NER fallback: any PERSON entity not already found
         found_names = {r[0].lower() for r in results}
-        for n in ner_names:
+        for n in _ner_entities:
             if n.lower() not in found_names and _valid_name(n):
                 results.append((n.title(), "mentioned"))
 
@@ -1743,12 +1815,14 @@ class RealtimeTranscriber:
                 threading.Thread(target=self._llm_identify_speakers, daemon=True).start()
 
     def _extract_names_with_ner(self, text):
-        """Extract person names from text using spaCy NER. Strips Portuguese honorific prefixes."""
+        """Extract person names from text using spaCy NER. Strips honorific prefixes."""
         if not self.nlp: return []
         try:
             doc = self.nlp(text)
-            # Strip Portuguese honorifics (Sr./Sra./Dr./Dra.) before returning names
-            return [re.sub(r'^(Sr\.|Sra\.|Dr\.|Dra\.)\s+', '', ent.text.strip(), flags=re.IGNORECASE) for ent in doc.ents if ent.label_ == "PER" and len(ent.text.strip()) > 2]
+            # pt models label persons "PER"; en models label them "PERSON"
+            return [re.sub(r'^(Sr\.|Sra\.|Dr\.|Dra\.|Mr\.|Mrs\.|Ms\.)\s+', '', ent.text.strip(), flags=re.IGNORECASE)
+                    for ent in doc.ents
+                    if ent.label_ in ("PER", "PERSON") and len(ent.text.strip()) > 2]
         except Exception: return []
 
     def _detect_gender_from_text(self, text):
@@ -2196,9 +2270,13 @@ class RealtimeTranscriber:
         return transcript_file, audio_file
 
     def feed_audio_chunk(self, audio_data: np.ndarray):
-        """Enqueue an audio chunk (np.float32, 16 kHz) -- used in file mode."""
+        """Enqueue an audio chunk (np.float32, 16 kHz) -- used in file mode.
+
+        Does NOT retain audio in all_audio_chunks: in file mode the source file
+        already holds the audio, so keeping a full in-RAM copy (~75 MB for a
+        20-min meeting) is wasteful and risks exhausting RAM.
+        """
         chunk = audio_data.flatten().astype(np.float32)
-        self.all_audio_chunks.append(chunk.copy())
         try:
             self.audio_queue.put_nowait(chunk)
         except queue.Full:

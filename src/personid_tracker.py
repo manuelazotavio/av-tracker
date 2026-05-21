@@ -32,7 +32,8 @@ class PersonIDTracker:
     ENROLL_MIN_DIVERSITY = 0.05  # min avg pairwise cosine distance — ensures varied angles
     CONFIRM_FRAMES = 5      # consecutive frames needed to confirm a known-name assignment
 
-    def __init__(self, model_path="od_model/edgeface_xxs.pt", device="cuda"):
+    def __init__(self, model_path="od_model/edgeface_xxs.pt", device="cuda",
+                 max_identities=None):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
         self.tracker = ByteTrack(track_buffer=90)  # ~3s at 30fps before track dies
         net = _EdgeFaceXXS()
@@ -41,6 +42,10 @@ class PersonIDTracker:
         self.model = net.to(self.device).eval()
         self.known_embeddings = {}   # name -> np.array (512,)
         self.emb_dir = None
+        # Hard ceiling on distinct identities (= expected speaker count).
+        # When reached, new faces force-merge into the closest existing identity
+        # instead of spawning Person_N+1.
+        self._max_identities = max_identities
 
         # Auto-enrollment state
         self._track_buffer = {}      # track_id -> list of embeddings
@@ -212,6 +217,15 @@ class PersonIDTracker:
         avg_emb = np.mean(embeddings, axis=0)
         avg_emb = avg_emb / (np.linalg.norm(avg_emb) + 1e-8)
 
+        # Names held by another LIVE track (seen in the last 2s). A dead track's
+        # identity is free to reuse — the person simply re-appeared after losing
+        # tracking. Two faces visible at once must not share one identity.
+        _now = time.time()
+        live_names = {
+            tname for tid, tname in self._track_to_name.items()
+            if tid != track_id and (_now - self._track_last_seen.get(tid, 0.0)) < 2.0
+        }
+
         # Check if close enough to a known person to merge (bypass MATCH_THRESHOLD, use MERGE_THRESHOLD directly)
         # so different-angle views of the same face don't create duplicates
         merge_name, merge_score = None, -1.0
@@ -220,18 +234,35 @@ class PersonIDTracker:
             if score > merge_score:
                 merge_score = score
                 merge_name = name
-        # Don't merge if the target name is already confirmed for another active track.
-        # Two distinct people cannot share the same identity.
-        _merge_blocked = merge_name is not None and any(
-            tid != track_id and tname == merge_name
-            for tid, tname in self._track_to_name.items()
-        )
+        # Don't merge into a name currently held by another LIVE track.
+        _merge_blocked = merge_name is not None and merge_name in live_names
         if merge_name is not None and merge_score >= self.MERGE_THRESHOLD and not _merge_blocked:
             logger.debug(f"👤 Enroll track={int(track_id)}: MERGED into '{merge_name}' (sim={merge_score:.3f} >= {self.MERGE_THRESHOLD})")
             self._track_to_name[track_id] = merge_name
             return merge_name
         if _merge_blocked:
-            logger.debug(f"👤 Enroll track={int(track_id)}: merge BLOCKED ('{merge_name}' already belongs to another track) → new Person_N")
+            logger.debug(f"👤 Enroll track={int(track_id)}: merge BLOCKED ('{merge_name}' on a live track) → new Person_N")
+
+        # Identity cap: never exceed the expected speaker count. Force-merge into
+        # the closest existing identity whose track is not currently live.
+        if self._max_identities is not None:
+            existing = set(self._track_to_name.values())
+            if len(existing) >= self._max_identities and not _merge_blocked:
+                cand = {n: self.known_embeddings[n] for n in existing
+                        if n in self.known_embeddings and n not in live_names}
+                if cand:
+                    forced = max(cand, key=lambda n: float(np.dot(avg_emb, cand[n])))
+                    forced_score = float(np.dot(avg_emb, cand[forced]))
+                    logger.debug(f"👤 Enroll track={int(track_id)}: identity cap reached "
+                                 f"({len(existing)}/{self._max_identities}) → forced merge "
+                                 f"into '{forced}' (sim={forced_score:.3f})")
+                    self._track_to_name[track_id] = forced
+                    self._face_events.append({
+                        "ts": time.time(), "event": "enroll",
+                        "track_id": int(track_id), "name": forced,
+                        "merge_target": forced, "merge_score": round(forced_score, 4),
+                    })
+                    return forced
 
         self._person_counter += 1
         name = f"Person_{self._person_counter}"
