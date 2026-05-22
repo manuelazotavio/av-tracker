@@ -150,12 +150,49 @@ def _init_heavy_deps():
         logger.error(f"Error loading dependencies: {e}")
         raise
 
+
+# Words that must never be treated as person names. Whisper capitalises
+# sentence-initial words, so "Yeah, ..." / "Olha, ..." look like a vocative
+# ("Name, ...") to the regex rules. Used both to filter name detection and as
+# a safety net before any embedding is saved.
+_VOCATIVE_BLOCKLIST = {
+    # Portuguese discourse markers / fillers
+    'pessoal', 'gente', 'galera', 'turma', 'cara', 'mano', 'brother',
+    'professor', 'professora', 'doutor', 'doutora',
+    'obrigado', 'obrigada', 'desculpa', 'tchau', 'oi', 'olá', 'olha', 'olhe',
+    'sim', 'não', 'bom', 'boa', 'tudo', 'certo', 'pronto',
+    'então', 'agora', 'aqui', 'assim', 'tipo', 'enfim', 'viu', 'sabe', 'entendeu',
+    'claro', 'ou', 'mas', 'porque', 'porém', 'pois', 'logo',
+    'talvez', 'nunca', 'sempre', 'ainda', 'também', 'aliás',
+    'legal', 'verdade', 'exato', 'beleza', 'tranquilo', 'show',
+    'viado', 'meu', 'minha', 'nosso', 'nossa', 'dele', 'dela',
+    'isso', 'esse', 'essa', 'aquele', 'aquela', 'qual', 'quem',
+    'onde', 'como', 'quando', 'quanto', 'vamos', 'bora',
+    'hein', 'né', 'pô', 'putz', 'caramba', 'caraca',
+    'maravilha', 'perfeito', 'exatamente', 'simplesmente',
+    # English discourse markers / fillers
+    'yeah', 'yep', 'yes', 'no', 'nope', 'ok', 'okay', 'so', 'well',
+    'right', 'now', 'look', 'hey', 'hi', 'hello', 'um', 'uh', 'hmm',
+    'oh', 'ah', 'anyway', 'alright', 'actually', 'basically', 'like',
+    'sure', 'maybe', 'please', 'thanks', 'thank', 'sorry', 'exactly',
+    'totally', 'honestly', 'obviously', 'listen', 'wait', 'and', 'but',
+    'or', 'because', 'then', 'also', 'just', 'really', 'here', 'there',
+    'this', 'that', 'what', 'who', 'when', 'where', 'why', 'how',
+    'which', 'guys', 'everyone', 'folks', 'man', 'dude', 'mean',
+}
+
+
 class RealtimeTranscriber:
-    def __init__(self, verifier, hf_token, whisper_size="medium", device="cuda", use_ai_analysis=True, diarization_clustering_threshold=0.6, verifier_confidence_min=0.8, chunk_duration=2.0, sample_rate=16000, shared_state=None, num_speakers=None, audio_device=None, language="pt"):
+    def __init__(self, verifier, hf_token, whisper_size="medium", device="cuda", use_ai_analysis=True, diarization_clustering_threshold=0.6, verifier_confidence_min=0.8, chunk_duration=2.0, sample_rate=16000, shared_state=None, num_speakers=None, audio_device=None, language="pt", emb_dir=None):
         _init_heavy_deps()
         self.verifier = verifier
         self.device = device
         self.language = language  # Whisper transcription language ("pt", "en", ...)
+        # Directory where live/auto embeddings are saved. Defaults to the
+        # production data/embeddings; overridden in fresh mode for isolation.
+        self.emb_dir = emb_dir or os.path.join(
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+            "data", "embeddings")
         self.use_ai_analysis = use_ai_analysis
         self.diarization_clustering_threshold = diarization_clustering_threshold
         self.verifier_confidence_min = verifier_confidence_min
@@ -1405,8 +1442,7 @@ class RealtimeTranscriber:
                     return
 
             # 6. Save voice embedding
-            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            emb_dir = os.path.join(base_dir, "data", "embeddings")
+            emb_dir = self.emb_dir
 
             mx = np.abs(audio_np).max()
             if mx > 0:
@@ -1561,36 +1597,7 @@ class RealtimeTranscriber:
         Returns: list of (name, role) where role is "addressee" or "mentioned"
         """
         results = []
-        # Words that should never be treated as person names in vocative context
-        _blocklist = getattr(self, '_vocative_blocklist', None)
-        if _blocklist is None:
-            self._vocative_blocklist = {
-                'pessoal', 'gente', 'galera', 'turma', 'cara', 'mano', 'brother',
-                'professor', 'professora', 'doutor', 'doutora',
-                'obrigado', 'obrigada', 'desculpa', 'tchau', 'oi', 'olá',
-                'sim', 'não', 'bom', 'boa', 'tudo', 'certo', 'pronto',
-                'então', 'agora', 'aqui', 'assim', 'tipo', 'enfim',
-                # Common PT-BR words that Whisper capitalizes at sentence start
-                'claro', 'ou', 'mas', 'porque', 'porém', 'pois', 'logo',
-                'talvez', 'nunca', 'sempre', 'ainda', 'também', 'aliás',
-                'legal', 'verdade', 'exato', 'beleza', 'tranquilo', 'show',
-                'viado', 'meu', 'minha', 'nosso', 'nossa', 'dele', 'dela',
-                'isso', 'esse', 'essa', 'aquele', 'aquela', 'qual', 'quem',
-                'onde', 'como', 'quando', 'quanto', 'vamos', 'bora',
-                'hein', 'né', 'pô', 'putz', 'caramba', 'caraca',
-                'maravilha', 'perfeito', 'exatamente', 'simplesmente',
-                # English discourse markers / fillers that Whisper capitalizes
-                # at sentence start — never person names.
-                'yeah', 'yep', 'yes', 'no', 'nope', 'ok', 'okay', 'so', 'well',
-                'right', 'now', 'look', 'hey', 'hi', 'hello', 'um', 'uh', 'hmm',
-                'oh', 'ah', 'anyway', 'alright', 'actually', 'basically', 'like',
-                'sure', 'maybe', 'please', 'thanks', 'thank', 'sorry', 'exactly',
-                'totally', 'honestly', 'obviously', 'listen', 'wait', 'and', 'but',
-                'or', 'because', 'then', 'also', 'just', 'really', 'here', 'there',
-                'this', 'that', 'what', 'who', 'when', 'where', 'why', 'how',
-                'which', 'guys', 'everyone', 'folks', 'man', 'dude', 'mean',
-            }
-            _blocklist = self._vocative_blocklist
+        _blocklist = _VOCATIVE_BLOCKLIST
 
         def _valid_name(n):
             return (n and len(n) >= 2 and n[0].isupper()
@@ -1934,9 +1941,16 @@ class RealtimeTranscriber:
 
     def _save_live_embedding(self, speaker_id, name, old_name=None):
         """Save a voice embedding from accumulated audio for a newly identified speaker."""
+        # Safety net: never persist an embedding under an implausible name —
+        # discourse markers ("And", "Oh", "Olha"), "Unknown" or empty. Generic
+        # IDs (spk_N, Person_N) are allowed: they exist for the rename cycle.
+        _base = re.sub(r'\s+\d+$', '', (name or '')).strip()
+        if not self._is_generic_name(_base):
+            if not _base or _base.lower() in _VOCATIVE_BLOCKLIST or _base.lower() == 'unknown':
+                logger.debug(f"Skipped embedding save — implausible name '{name}'")
+                return
         audio_chunks = self.unknown_speakers_audio.get(speaker_id, [])
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        emb_dir = os.path.join(base_dir, "data", "embeddings")
+        emb_dir = self.emb_dir
 
         face_tracker = self.shared_state.get("face_tracker")
 

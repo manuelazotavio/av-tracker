@@ -47,7 +47,7 @@ def _draw_labels_unicode(frame_bgr, labels):
 
 
 class MultimodalFusion:
-    def __init__(self, hf_token, device="cuda", num_speakers=None, audio_device=None, video_file=None, screen_region=None, headless=False, render_out=None):
+    def __init__(self, hf_token, device="cuda", num_speakers=None, audio_device=None, video_file=None, screen_region=None, headless=False, render_out=None, fresh=False):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
         self.video_file = video_file  # None → real-time webcam
         self.render_out = render_out  # path → offline render mode (annotated video, no live display)
@@ -69,8 +69,16 @@ class MultimodalFusion:
         }
 
         base_dir = os.path.abspath(os.path.dirname(__file__))
-        emb_dir = os.path.join(base_dir, "data", "embeddings")
-        face_emb_dir = os.path.join(base_dir, "data", "face_embeddings")
+        # Fresh mode (footage testing): use isolated embedding dirs so the
+        # production database is neither loaded (no false "Manuela" matches on
+        # other people) nor polluted with test-session enrollments.
+        if fresh:
+            emb_dir = os.path.join(base_dir, "data", "embeddings_test")
+            face_emb_dir = os.path.join(base_dir, "data", "face_embeddings_test")
+            print(f"🧪 Fresh mode — isolated embeddings: {emb_dir}")
+        else:
+            emb_dir = os.path.join(base_dir, "data", "embeddings")
+            face_emb_dir = os.path.join(base_dir, "data", "face_embeddings")
 
         os.makedirs(emb_dir, exist_ok=True)
         os.makedirs(face_emb_dir, exist_ok=True)
@@ -93,6 +101,7 @@ class MultimodalFusion:
             num_speakers=num_speakers,
             audio_device=audio_device,
             language="en",  # "pt" for PT-BR; "en" for AMI corpus testing
+            emb_dir=emb_dir,  # isolated dir in fresh mode
         )
 
         self.detector = YOLOFaceDetector(model_path="od_model/yolov8n-face.pt", device=self.device)
@@ -325,7 +334,9 @@ class MultimodalFusion:
                 display_name = person_names.get(person_id, res['name']) if person_id else res['name']
                 x1, y1, x2, y2 = res['bbox']
                 label = f"{display_name} ({res['confidence']:.2f})"
-                color = (0, 255, 0) if not _generic_re.match(display_name) else (0, 0, 255)
+                # Red only for an unidentified face; green once it has any
+                # tracked identity (Person_N, spk_N) or a real name.
+                color = (0, 0, 255) if display_name == "Unknown" else (0, 255, 0)
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                 _labels.append((label, int(x1), int(y1) - 24, color))
             if _labels:
@@ -377,9 +388,13 @@ class MultimodalFusion:
         """Mux the original video's audio into the rendered (video-only) output."""
         import subprocess
         try:
+            # Re-encode the OpenCV mp4v stream to H.264 (yuv420p) so the output
+            # plays in every player — Windows Media Player can't decode mp4v.
             subprocess.run(
                 ["ffmpeg", "-y", "-i", temp_video, "-i", self.video_file,
-                 "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac",
+                 "-map", "0:v", "-map", "1:a",
+                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                 "-pix_fmt", "yuv420p", "-c:a", "aac",
                  "-shortest", self.render_out],
                 check=True, capture_output=True,
             )
@@ -472,6 +487,7 @@ def _parse_args():
     parser.add_argument("--monitor", type=int, default=1, help="Monitor index for meeting mode")
     parser.add_argument("--headless", action="store_true", help="No interactive prompts (for GUI launch)")
     parser.add_argument("--render", action="store_true", help="Offline render: write an annotated video file instead of live display (requires --video)")
+    parser.add_argument("--fresh", action="store_true", help="Use isolated embedding dirs (data/*_test) — for footage testing without touching the production database")
     args, _ = parser.parse_known_args()
     return args
 
@@ -577,5 +593,5 @@ if __name__ == "__main__":
     app = MultimodalFusion(HF_TOKEN, num_speakers=num_speakers, audio_device=audio_device,
                            video_file=video_file, screen_region=screen_region,
                            headless=args.headless or render_out is not None,
-                           render_out=render_out)
+                           render_out=render_out, fresh=args.fresh)
     app.run()

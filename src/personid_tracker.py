@@ -35,7 +35,9 @@ class PersonIDTracker:
     def __init__(self, model_path="od_model/edgeface_xxs.pt", device="cuda",
                  max_identities=None):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
-        self.tracker = ByteTrack(track_buffer=90)  # ~3s at 30fps before track dies
+        # track_buffer in frames: 150 = 5s @ 30fps webcam, 15s @ 10fps file mode.
+        # Long enough to survive a meeting participant looking down at notes.
+        self.tracker = ByteTrack(track_buffer=150)
         net = _EdgeFaceXXS()
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         net.load_state_dict(state_dict)

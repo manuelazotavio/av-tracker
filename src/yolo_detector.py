@@ -4,7 +4,7 @@ import numpy as np
 from ultralytics import YOLO
 
 class YOLOFaceDetector:
-    def __init__(self, model_path="od_model/yolov8n-face.pt", conf_threshold=0.5, device="cuda"):
+    def __init__(self, model_path="od_model/yolov8n-face.pt", conf_threshold=0.3, device="cuda"):
         self.device = 'cuda' if torch.cuda.is_available() and device == "cuda" else 'cpu'
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
