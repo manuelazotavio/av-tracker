@@ -327,11 +327,22 @@ class MultimodalFusion:
 
             # Draw a box for every tracked face. Rectangles via cv2; text via PIL
             # (cv2.putText cannot render accents — "Vinícius" → "Vin??cius").
+            # Highest-confidence faces are processed first and identity
+            # uniqueness is enforced: one name cannot label two faces at once.
             _labels = []
-            for res in results:
+            _names_this_frame = set()
+            for res in sorted(results, key=lambda r: r['confidence'], reverse=True):
                 track_id = res['track_id']
                 person_id = current_faces.get(track_id)
                 display_name = person_names.get(person_id, res['name']) if person_id else res['name']
+                # An identity already shown on another face this frame is a
+                # duplicate — only one face can be a given person. Fall back
+                # to Unknown for the lower-confidence one.
+                if display_name != "Unknown":
+                    if display_name in _names_this_frame:
+                        display_name = "Unknown"
+                    else:
+                        _names_this_frame.add(display_name)
                 x1, y1, x2, y2 = res['bbox']
                 label = f"{display_name} ({res['confidence']:.2f})"
                 # Red only for an unidentified face; green once it has any

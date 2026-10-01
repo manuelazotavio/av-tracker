@@ -1,0 +1,6 @@
+evidence_group,segments,percentage
+voice_only,67,4.036
+voice_corroborated,76,4.578
+active_speaker,580,34.94
+face_gender,435,26.205
+session_context,502,30.241

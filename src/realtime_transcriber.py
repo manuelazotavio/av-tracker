@@ -1914,10 +1914,24 @@ class RealtimeTranscriber:
             'legal', 'verdade', 'exato', 'beleza', 'tranquilo', 'show',
             'viado', 'meu', 'minha', 'nosso', 'nossa', 'simplesmente',
             'maravilha', 'perfeito', 'exatamente', 'piloto', 'obrigado',
+            # English — capitalized words that follow "I'm ..." but aren't names
+            'american', 'british', 'brazilian', 'english', 'canadian', 'irish',
+            'australian', 'german', 'french', 'spanish', 'italian', 'indian',
+            'chinese', 'japanese', 'scottish', 'welsh', 'european',
+            'marketing', 'sorry', 'sure', 'fine', 'okay', 'afraid', 'glad',
+            'ready', 'done', 'here', 'good', 'happy', 'gay', 'straight',
         }
-        patterns = [r'(?:meu nome é|me chamo|eu sou|sou o|sou a)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)', r'(?:aqui é|aqui quem fala é)\s+(?:o|a)?\s*([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)']
+        # Keyword is case-insensitive via (?i:...); the captured name stays
+        # case-sensitive so only Capitalized tokens are taken as names — a
+        # global re.IGNORECASE would let lowercase words ("and") be captured.
+        patterns = [
+            r"(?i:meu nome é|me chamo|eu sou|sou o|sou a)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)",
+            r"(?i:aqui é|aqui quem fala é)\s+(?:o|a)?\s*([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)",
+            # English self-introduction: "I'm Laura", "I am David", "my name is X", "this is X"
+            r"\b(?i:i'?m|i am|my name(?:'s| is)|this is|call me)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)",
+        ]
         for p in patterns:
-            m = re.search(p, text, re.IGNORECASE)
+            m = re.search(p, text)
             if m:
                 raw = m.group(1)
                 # Reject: must start uppercase in original text AND not be a common word

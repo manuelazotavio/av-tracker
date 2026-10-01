@@ -1,0 +1,112 @@
+{
+  "dataset": {
+    "sessions_with_segments": 92,
+    "segments": 1660,
+    "validated_sessions": 24,
+    "validated_segments": 330,
+    "expected_participant_distribution": {
+      "1": 19,
+      "2": 7,
+      "3": 4,
+      "4": 62
+    }
+  },
+  "latency": {
+    "segment_duration_seconds": {
+      "mean": 3.386283,
+      "median": 2.94,
+      "maximum": 15.0
+    },
+    "transcription_milliseconds": {
+      "mean": 962.297831,
+      "median": 513.6,
+      "maximum": 20718.3
+    },
+    "voice_verification_milliseconds": {
+      "mean": 61.104157,
+      "median": 29.7,
+      "maximum": 1695.2
+    },
+    "total_processing_milliseconds": {
+      "mean": 1532.563614,
+      "median": 633.05,
+      "maximum": 21052.1
+    },
+    "real_time_factor": {
+      "mean": 0.55989,
+      "median": 0.23635,
+      "maximum": 13.7523
+    },
+    "segments_below_real_time": 1488,
+    "segments_below_real_time_percentage": 89.639
+  },
+  "validation": {
+    "statistics": [
+      {
+        "subset": "all_validated_segments",
+        "correct": 37,
+        "total": 330,
+        "accuracy_percentage": 11.212,
+        "wilson_95_low_percentage": 8.245,
+        "wilson_95_high_percentage": 15.072
+      },
+      {
+        "subset": "named_predictions",
+        "correct": 37,
+        "total": 124,
+        "accuracy_percentage": 29.839,
+        "wilson_95_low_percentage": 22.49,
+        "wilson_95_high_percentage": 38.399
+      },
+      {
+        "subset": "unflagged_named_predictions",
+        "correct": 9,
+        "total": 11,
+        "accuracy_percentage": 81.818,
+        "wilson_95_low_percentage": 52.302,
+        "wilson_95_high_percentage": 94.863
+      },
+      {
+        "subset": "flagged_named_predictions",
+        "correct": 28,
+        "total": 113,
+        "accuracy_percentage": 24.779,
+        "wilson_95_low_percentage": 17.736,
+        "wilson_95_high_percentage": 33.48
+      }
+    ],
+    "fisher_exact_two_sided_p": 0.0002936251,
+    "contingency_table": {
+      "unflagged": [
+        9,
+        2
+      ],
+      "flagged": [
+        28,
+        85
+      ]
+    }
+  },
+  "decision_counts": {
+    "ASD": 442,
+    "ASD_GUESS": 138,
+    "FACE_ONLY": 16,
+    "GENDER_FACE": 87,
+    "GENDER_OVERRIDE": 4,
+    "GENDER_REROUTE": 29,
+    "SESSION_FACE": 270,
+    "SESSION_HINT": 493,
+    "SESSION_TRACKER": 9,
+    "SINGLE_FACE": 29,
+    "VERIFIER_HIGH": 51,
+    "VERIFIER_MOD": 16,
+    "VERIFIER_WEAK": 76
+  },
+  "evidence_group_counts": {
+    "voice_only": 67,
+    "voice_corroborated": 76,
+    "active_speaker": 580,
+    "face_gender": 435,
+    "session_context": 502
+  }
+}

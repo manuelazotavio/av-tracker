@@ -1,0 +1,5 @@
+subset,correct,total,accuracy_percentage,wilson_95_low_percentage,wilson_95_high_percentage
+all_validated_segments,37,330,11.212,8.245,15.072
+named_predictions,37,124,29.839,22.49,38.399
+unflagged_named_predictions,9,11,81.818,52.302,94.863
+flagged_named_predictions,28,113,24.779,17.736,33.48

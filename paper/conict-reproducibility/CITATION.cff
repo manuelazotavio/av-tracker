@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "Use o título do artigo para citar este artefato após o fim da revisão anônima."
+title: "Artefato anônimo de reprodutibilidade de um sistema multimodal"
+type: software
+version: 1.0.0
+date-released: 2026-08-04
+repository-code: "https://github.com/anonimo826/anonimo"

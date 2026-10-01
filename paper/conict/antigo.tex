@@ -1,0 +1,218 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%% Modelo desenvolvido por Alunos do IFSP - PEP para o CONICT 2020.
+% Autores: Christopher Alves de Oliveira, Inácio Ribeiro, Paulo Ricardo Servilha Sparapan.
+% Professores: Alexandre Ataide Carniato e Diego Nunes da Silva
+% Data: 18/08/2020.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Atualizado para o CONICT 2021 - Cubatão pelo professor Glauber Renato Colnago 
+% Data: 7/6/2021
+% Atualizado para o CONICT 2022 - São Paulo pelo professor Francisco Yastami Nakamoto 
+% Data: 24/06/2022
+% Atualizado para o CONICT 2023 - Capivari pelo professor Thiago Pedro Donadon Homem
+% Data: 24/05/2023
+% Atualizado para o CONICT 2024 - Barretos pelo professor Rodrigo Yamakami Camilo
+% Data: 09/05/2024
+%Atualizado para o CONICT 2025 - Campinas pela professora Emanuella Maria Barreto Fonseca
+%Data: 07/05/2025
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[a4paper,11pt]{article} %Selecionando a classe que gera artigos.
+
+\input{preambulo} %Pacotes principais
+% --- INÍCIO: CONFIGURAÇÃO DEFINITIVA - PADRÃO CONICT (WORD) ---
+
+% Carrega o pacote para configurar as legendas
+\usepackage{caption}
+
+% 1. Pede ao pacote BABEL para usar os nomes em MAIÚSCULAS.
+% Isto é necessário para sobrescrever o padrão "Figura".
+\addto\captionsbrazil{%
+  \renewcommand{\figurename}{FIGURA}%
+  \renewcommand{\tablename}{TABELA}%
+}
+
+% 2. Configura a aparência da legenda para ser idêntica ao modelo Word.
+\captionsetup{
+  position=top,             % Posição: ACIMA da figura/tabela
+  justification=justified,  % Alinhamento: Longas justificadas...
+  singlecheck=on,           % ...e curtas centralizadas
+  labelsep=period,          % Separador: Ponto final
+  textfont=up               % Fonte do Texto da Legenda: Normal (não negrito)
+}
+
+% --- FIM DA CONFIGURAÇÃO ---
+\fancypagestyle{empty}{%
+\fancyhf{}% clear all header and footer fields
+\fancyfoot[L]{16º CONICT 2025} % except the center
+\fancyfoot[C]{\thepage} % except the center
+\fancyfoot[R]{ISSN: 2178-9959} % except the center
+\renewcommand{\headrulewidth}{0pt}%
+\renewcommand{\footrulewidth}{0pt}%
+}
+
+\usepackage{float}
+
+
+
+\pagestyle{empty}
+
+
+
+\begin{document} %Begin Inicia o Documento
+
+
+
+\input{cabecalho} %Alterar Título, autores, e apagar tabela !
+
+%----------------------------------------TEXTOS-------------------------------------------------%
+
+
+\vspace{0.5cm}
+\noindent\textbf{RESUMO}: Este trabalho apresenta o estudo e desenvolvimento de uma solução que integra a aquisição automatizada de dados públicos de turismo à um assistente virtual hospedado e integrado à plataforma WhatsApp, objetivando agilizar a busca em guias turísticos. Implementado em Node.js com a biblioteca ExcelJS, o sistema filtra, com base nas escolhas do usuário, informações oficiais por segmento de turismo e idiomas do guia turístico. O chatbot, criado com whatsapp-web.js, permite que o usuário obtenha resultados individualizados. Nos testes realizados, houve uma redução média no tempo de busca de aproximadamente 80,60\%. Desta forma, a solução demonstra potencial para democratizar o acesso a informações turísticas e promover inclusão digital.
+
+\vspace{0.5cm}
+\noindent\textbf{PALAVRAS-CHAVE}: automação; chatbot; dados públicos; assistente virtual; inclusão digital; turismo.
+
+\vspace{0.5cm}
+\begin{center}
+\textbf{INTEGRATION OF PUBLIC TOURISM\\DATA INTO VIRTUAL ASSISTANTS}
+\end{center}
+
+\noindent\textbf{ABSTRACT}: This paper explores the design and development of a solution that integrates the automated collection of public tourism data with a virtual assistant hosted on the WhatsApp platform. The goal is to streamline the process of finding tour guides. Built using Node.js and the ExcelJS library, the system filters official data based on user preferences such as tourism segment and guide language. The chatbot, developed with whatsapp-web.js, delivers personalized results to users. In testing, the average search time was reduced by approximately 80.60\%. This demonstrates the solution’s potential to democratize access to tourism information and foster digital inclusion.
+
+\vspace{0.5cm}
+\noindent\textbf{KEYWORDS}: automation; chatbot; open data; virtual assistant; digital inclusion; tourism; 
+
+\section*{Introdução}
+
+
+Em municípios que frequentemente recebem muitos turistas, como o de Caraguatatuba, no Litoral Norte de São Paulo, a busca por guias turísticos representa um desafio cotidiano para inúmeros visitantes da cidade, sendo agravado por fatores como a desigualdade do acesso digital \cite{ref11}, limitações no uso de ferramentas online para a procura desses prestadores de serviço e interfaces pouco intuitivas. Surge, dessa forma, a necessidade da criação de soluções tecnológicas acessíveis e que auxiliem no acesso dessas informações. Este artigo apresenta o estudo e desenvolvimento de um assistente virtual utilizando um aplicativo de mensagens presente no dia a dia da maioria das pessoas, o WhatsApp. 
+
+Assistentes virtuais conversacionais são agentes integrados a uma interface com o objetivo de melhorar a comunicação com o usuário e atrair sua atenção em momentos determinados, visando enfatizar a apresentação de informações ou recomendações \cite{reategui2005assistente}. Baseando-se no uso de \textit{bots} automatizados de mensagens, a abordagem deste estudo segue a mesma linha de um dos primeiros assistentes criados para tal função, o projeto A.L.I.C.E. Este projeto surgiu em 1995, e funciona baseado na procura por palavras-chave na pergunta do usuário e responde com uma frase pré-programada \cite{alice}. Este estudo investigou como o conceito do projeto A.L.I.C.E poderia ser implementado com tecnologias atuais, onde o \textit{Bot} é capaz de automatizar tarefas repetitivas em plataformas de comunicação de forma simples \cite{weni}.
+
+O Cadastur é o sistema de cadastro de pessoas físicas e jurídicas que atuam no setor do turismo ~\cite{cadastur2025}. Este cadastro está presente para consultas abertas tanto no Portal de Dados Abertos, que pode ser acessado através do website Gov.br, quanto pelo website Cadastur. A motivação principal deste estudo advém da necessidade desta funcionalidade observada em uma solução criada para o Hackathon IFSP-SeTUR (2025), sendo premiada com o primeiro lugar no desafio. Este resultado mostra não só a inovação e aplicabilidade da proposta vencedora, mas também como o reconhecimento no evento destaca o potencial da abordagem para pesquisas mais aprofundadas.
+
+\section*{Materiais e Métodos}
+
+O presente trabalho contou com a participação de um grupo de 10 voluntários, com idades entre 18 e 57 anos, todos com diferentes graus de familiaridade digital, executando duas tarefas idênticas: (i) localizar manualmente, no site do Cadastur, um guia do segmento Cultural que fale Português; e (ii) repetir a tarefa via chatbot no WhatsApp. O processo manual foi realizado através de dados da Cadastur como número do certificado, nome, local, bairro e atividade do guia, conforme ilustrado na FIGURA~\ref{fig:cadastur}.
+
+\begin{figure}[H]
+    \centering
+    \caption{Tabela de guias turísticos do website Cadastur}
+    \includegraphics[width=0.90\textwidth]{figuracadastur.png}
+     \label{fig:cadastur}
+\end{figure}
+
+Para acessar a tabela, foi necessário que se inserissem alguns campos obrigatórios, como a cidade em que o guia atende, o tipo de serviço turístico e preencher um captcha. Logo em seguida, é apresentada uma tabela extensa de todos os guias daquela cidade, e para cada guia, precisou-se clicar no ícone de lupa para consultar as informações detalhadas sobre ele. 
+
+Para a posterior utilização do assistente virtual, foi configurado que ele questionasse qual o segmento de turismo em que o visitante está interessado (por exemplo: Praia, Aventura, Náutico, entre outros). Após esse processo, o turista é consultado sobre o idioma que deseja que o guia tenha domínio. O algoritmo reúne todas as informações, salva na sessão, e executa a função que filtra os guias. Após filtrados, os guias são retornados ao usuário, de forma acessível, separados por ícones que representam cada informação (nome, celular, certificado, website, etc). O chatbot permanece ativo, aguardando mais mensagens do cliente, sendo possível filtrar novos serviços caso seja necessário. A FIGURA~\ref{fig:prototipo} apresenta um protótipo de como a interação ocorre na plataforma.
+
+\begin{figure}[H]
+    \centering
+    \captionsetup{justification=centering}
+    \caption{Protótipo de interação no WhatsApp, mostrando o assistente\\ virtual sugerindo filtros para facilitar a escolha do guia turístico.}
+    \includegraphics[width=0.4\textwidth]{prototipo2.png}
+    \label{fig:prototipo}
+\end{figure}
+O desenvolvimento do chatbot foi realizado com JavaScript, usando a biblioteca \texttt{exceljs} para a leitura automatizada da planilha de guias turísticos no Portal de Dados Abertos. A escolha da linguagem JavaScript advém da sua versatilidade em diversas funções, especialmente quando integrada com outras bibliotecas \cite{paz2017perspectivas}. Entre as opções estudadas, a biblioteca \texttt{whatsapp-web.js} foi a escolhida para a emulação do WhatsApp Web, pois esta ferramenta permite que uma instância rode em background ao algoritmo, sem interferir em suas funcionalidades, e por ser uma biblioteca open-source, sua manutenabilidade é grande, em contraste com a API Oficial paga do WhatsApp Business. Para gerar o QR Code que autentica o WhatsApp Web, utilizou-se \texttt{qrcode-terminal}. A lógica geral do script está ilustrada na FIGURA~\ref{fig:fluxo-js}.
+
+\begin{figure}[H]
+    \centering
+    \captionsetup{justification=centering}
+    \caption{Fluxo do funcionamento do algoritmo em JavaScript,\\desde suas bibliotecas até suas funções.}
+    \includegraphics[width=1.0\textwidth]{diagrama4.png}
+    
+    \label{fig:fluxo-js}
+\end{figure}
+
+
+
+As seleções do menu podem ser realizadas tanto pelos números das opções (1, 2, 3, ...), quanto apenas pela palavra do segmento/idioma correspondente (ex: Português, Inglês, Espanhol, etc). A forma de escolha dos filtros é definida conforme a preferência do usuário, que torna a utilização do assistente significativamente mais dinâmico.
+
+\section*{Resultados e Discussão}
+
+Após realizados ambos os métodos de busca pelos voluntários, foi identificado que a busca manual exigiu navegação por várias telas, preenchimento de campos e consultas individuais. Em contrapartida, o assistente virtual desenvolvido para este estudo satisfez a necessidade da rapidez na entrega dos resultados filtrados. O tom amigável do chatbot e suas respostas diretas e empáticas foram as principais características mencionadas pelo grupo voluntário. 
+
+A implementação do WhatsApp Web utilizando a biblioteca whatsapp-web.js permitiu o gerenciamento de mensagens em tempo real, além do processamento de dados em massa de forma que a sessão do WhatsApp não encerrasse em nenhum momento, ainda que mais de três usuários estivessem requisitando o assistente simultâneamente. Esta integração resultou em um chatbot escalável e organizado. A TABELA ~\ref{tab:busca-participante} apresenta os resultados obtidos através do estudo, após o grupo ter buscado pelo guia específico das duas maneiras propostas.
+
+
+\begin{table}[H]
+  \centering
+  \captionsetup{justification=raggedright, singlelinecheck=false}
+  \caption{Tempo de busca por participante em minutos manualmente e com o bot.}
+  \label{tab:busca-participante}
+  \begin{tabular}{c c c c c c}
+    \hline
+    \textbf{Voluntário} & \textbf{Idade} & \textbf{Familiaridade Digital} & \textbf{Tempo Manual} & \textbf{Tempo Bot}  \\
+    \hline
+    1   & 54 & Baixa       & 05:10 & 01:19  \\
+    2    & 41 & Média         & 03:44 & 00:25  \\
+    3        & 18 & Alta         & 02:01 & 00:17 \\
+     4       & 20 & Baixa           & 04:14 & 00:26  \\ 
+     5       & 56 & Baixa          & 05:22 & 00:49
+        \\
+       6        & 24 & Alta          & 00:59 & 00:23  \\
+        7       & 18 & Alta         & 01:57 & 00:20 \\
+        8       & 57 & Média          & 04:25 & 00:51  \\
+        9       & 18 & Alta           & 01:03 & 00:29
+        \\
+        10      & 52 & Baixa       & 04:37 & 01:12 \\
+    \hline
+  \end{tabular}
+  
+\end{table}
+
+Em média, o chatbot reduziu o tempo de busca em 80{,}60\%
+(3:21 min para 0:39 min). A TABELA~\ref{tab:tempo-familiaridade} detalha os resultados por
+\emph{familiaridade digital} (Baixa, Média, Alta).
+
+\begin{table}[H]
+  \centering
+  \captionsetup{justification=raggedright, singlelinecheck=false}
+  \caption{Tempo médio por familiaridade digital com o uso manual e o uso do Bot.}
+  \label{tab:tempo-familiaridade}
+  \begin{tabular}{lccc}
+    \hline
+    \textbf{Familiaridade} & \textbf{Manual} & \textbf{Chatbot} & \textbf{Redução}\,\textbf{\%} \\
+    \hline
+    Baixa  & 8:51 & 0:56 & 80,57\% \\
+    Média  & 3:22 & 0:32 & 84,16\% \\
+    Alta   & 1:21 & 0:21 & 71,60\% \\
+    \hline
+  \end{tabular}
+\end{table}
+
+Dentro do estudo, alguns voluntários relataram que a interface do site Cadastur não apresentava traços intuitivos que ajudavam na busca de informações, além do fato que alguns dados sobre os segmentos turísticos que os guias atendem não estarem presentes no site, apenas na planilha do Portal de Dados Abertos. Destaca-se que os voluntários apresentaram grande facilidade em realizar iterações com o assistente virtual, sendo evidente como a humanização dos chatbots melhoram a qualidade de um processo anteriormente demorado e muitas vezes negligenciado, situação igualmente observada na implementação de chatbots no marketing digital \cite{vitor}.
+
+
+\section*{Conclusões}
+
+Este estudo apresentou o desenvolvimento de um assistente virtual no WhatsApp que integra planilhas Cadastur para localizar guias turísticos por segmento e idioma. As implicações práticas ressaltam a possibilidade de reduzir custos operacionais e tempo de busca para turistas, fomentando a economia local para prestadores da cidade, além de aumentar autonomia de usuários com baixa letracia digital. Tecnicamente, a solução mostrou-se viável em Node.js (ExcelJS, whatsapp-web.js) para um ambiente de teste controlado; entretanto, para uso em produção com altos volumes de acesso, deve-se considerar migração para a API oficial, mecanismos de sessão/filas e monitoramento de performance.
+
+Os resultados indicam que assistentes integrados a dados públicos podem efetivamente democratizar o acesso à informação turística e reduzir barreiras associadas em públicos com limitação em habilidades digitais.
+
+\section*{CONTRIBUIÇÕES DOS AUTORES}
+
+MANUELA O. DA SILVA:  Concepção do projeto, levantamento de ferramentas e tecnologias, desenvolvimento da solução proposta, coleta e análise dos dados, e discussão dos resultados obtidos.
+
+MARIO T. SHIMANUKI: Orientação na definição do escopo, validação da escolha das ferramentas e tecnologias e revisão da solução desenvolvida.
+
+Todos os autores contribuíram com a revisão do trabalho e aprovaram a versão submetida.
+
+\section*{Agradecimentos}
+Os autores agradecem ao Centro de Pesquisas CEPIN-CIS pela viabilização do estudo, bem como pelo suporte técnico e disponibilização de recursos essenciais para a realização deste trabalho. A todos que participaram direta ou indiretamente deste trabalho.
+
+
+%Referências Bibliográficas
+%\textbf{REFERÊNCIAS}
+
+\bibliography{bibliografia.bib}
+%\printbibliography[title={REFERÊNCIAS}]
+%\printbibliography{bibliografia}
+
+
+\end{document}

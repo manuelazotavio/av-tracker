@@ -1,0 +1,594 @@
+% ============================================================================
+% WVC 2026 (Workshop de Visão Computacional) — UNICAMP submission.
+% This file starts from the official IEEE conference template found by the
+% author (version 062824, ieee.org) and keeps its preamble byte-for-byte:
+% same core packages (cite; amsmath,amssymb,amsfonts; algorithmic; graphicx;
+% textcomp; xcolor), same \IEEEoverridecommandlockouts and no a4paper option.
+% The standard algorithm and url packages support the cascade float and
+% the anonymous artifact link.
+%
+% Two deliberate content adaptations from our working draft
+% (paper/wvc/wvc2026.tex) to fit this exact preamble:
+%   - Tables converted from booktabs (\toprule/\midrule/\bottomrule) to
+%     plain \hline rules, since booktabs is not in this template.
+%   - Algorithm 1 converted from algpseudocode syntax (\State/\If/\ElsIf/
+%     \Return) to plain algorithmic.sty syntax (\STATE/\IF/\ELSIF, with
+%     "\STATE \textbf{return} ..." standing in for \Return, which plain
+%     algorithmic.sty does not define).
+%
+% DOUBLE-BLIND NOTICE: author names/affiliations below are placeholders.
+% Do not restore real identities until the camera-ready version after
+% acceptance, since the CFP explicitly requires no identifying information
+% in the blind submission, including in acknowledgments or linked material.
+%
+% NOTE: this paper is deliberately structured around an analysis question
+% (does the necessity of audio-visual fusion vary across deployment
+% conditions?) rather than around the system itself, and does not cite or
+% reference the companion CONICT extended-abstract report on the same
+% system per the author's explicit instruction. Keep the System Overview
+% section compact; the stratified analysis in Results is this paper's
+% primary contribution.
+% ============================================================================
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+%Template version as of 6/27/2024
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{When Is Voice Not Enough? A Deployment-Scale Analysis of\\
+Multimodal Necessity in Real-Time Speaker Attribution}
+
+% TODO (camera-ready only): restore real author list / affiliation / emails.
+% Blind-submission placeholder below.
+\author{\IEEEauthorblockN{Anonymous Author(s)}
+\IEEEauthorblockA{Affiliation withheld for double-blind review}
+}
+
+\maketitle
+
+\begin{abstract}
+Multimodal speaker attribution systems are typically evaluated with a
+single aggregate accuracy or coverage figure, which implicitly assumes
+that the benefit of fusing voice, face, and active-speaker cues is
+uniform across deployment conditions. We test this assumption using
+deployment logs from a real-time meeting-tracking system that
+attributes each speech segment through an explicit, priority-ordered
+audio-visual fusion cascade rather than a single learned model. Across
+92 meeting sessions and 1,660 speech segments
+collected over two months, we find that reliance on voice biometrics
+varies from 5\% to 40\% of segments depending on expected group size,
+while visual and session evidence extends coverage to every accepted
+segment. The cascade sustains real-time throughput (89.6\% of segments
+faster than real time). In a human-reviewed subset, its risk flag
+separates unflagged named decisions (81.8\% exact agreement) from
+flagged ones (24.8\%; Fisher's exact $p<0.001$), effectively
+prioritizing review.
+\end{abstract}
+
+\begin{IEEEkeywords}
+biometrics, speaker recognition, feature extraction, feature matching and inference, active speaker detection, real-time computer vision, audio-visual fusion
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Multimodal speaker attribution combining voice biometrics, face
+re-identification, and active speaker detection (ASD) is generally
+reported to outperform any single modality
+\cite{chung2017lipsync,tao2021talknet,liao2023lightasd}. Almost all
+such evaluations, however, report one aggregate figure per system,
+computed over a benchmark whose composition (how many people are in
+frame, how long the deployment has been running, how well individual
+speakers are enrolled) is fixed by construction. A meeting-transcription
+system deployed in practice sees none of that stability. Group size
+varies from a one-on-one call to a full room, and the same system may
+run for months as its voice bank grows and its thresholds get tuned. Whether the reported benefit of fusion holds uniformly
+across these conditions, or is concentrated in some and nearly absent
+in others, is a question that a single aggregate figure cannot answer.
+
+We study this question using deployment logs from a real-time,
+single-machine multimodal meeting tracker that attributes each speech
+segment through an explicit \emph{priority cascade}, an ordered
+sequence of decision rules in which the first rule whose evidence
+requirement is met determines the final identity, rather than a single
+learned fusion model. At its core, the underlying problem is a
+multimodal \emph{biometric feature matching and inference} task, in
+which voice and face embeddings are extracted independently by two
+different feature-extraction pipelines (ECAPA-TDNN acoustic embeddings
+and EdgeFace visual embeddings) and must be matched, cross-checked, and
+reconciled online against a per-session identity registry. We use the
+cascade's logged decisions, collected over 92 real, unscripted sessions
+and 1{,}660 speech segments spanning just over two months, as an
+instrument to measure how the necessity of each modality shifts across
+deployment conditions rather than to report one more aggregate accuracy
+number.
+
+Our contributions are the following.
+
+\begin{enumerate}
+\item Evidence that reliance on voice biometrics is highly non-uniform
+across group sizes, ranging from 5\% to 40\% of segments, with a
+structural explanation tied to which cascade rule takes precedence at
+each group size, rather than a smooth trend.
+\item A demonstration that an apparent decline in voice-led
+resolution over a multi-month deployment is substantially confounded
+by a shift in session composition, a methodological caution for
+interpreting raw temporal trends in deployment logs without
+controlling for this kind of shift.
+\item A statistically tested human validation of the lightweight
+self-diagnostic risk monitor, together with a real-time performance
+characterization of the cascade under deployment conditions.
+\item A reproducible evaluation protocol, with anonymized segment-level
+tables and scripts that regenerate the reported metrics.
+\end{enumerate}
+
+\section{Related Work}
+
+\textbf{Speaker diarization and verification.} pyannote.audio
+\cite{bredin2020pyannote,bredin2023pyannote31} provides the diarization
+backbone used in our pipeline, segmenting and clustering speech into
+per-chunk speaker labels; diarization alone does not solve identity
+persistence across non-adjacent processing windows. ECAPA-TDNN
+\cite{desplanques2020ecapa}, trained on VoxCeleb, is the standard
+architecture for the fixed-dimensional speaker embeddings we use both
+for enrolled-speaker matching and for a persistent within-session
+tracker for unenrolled speakers.
+
+\textbf{Active speaker detection.} SyncNet-style lip-sync models
+\cite{chung2017lipsync} and TalkNet \cite{tao2021talknet} established
+the audio-visual correlation approach to ASD; Light-ASD
+\cite{liao2023lightasd} is a lightweight CVPR 2023 model designed for
+real-time inference, which we use as the primary ASD backend. We use
+YOLOv8 \cite{jocher2023yolov8} for face detection, ByteTrack
+\cite{zhang2022bytetrack} for short-term tracking, and EdgeFace
+\cite{george2024edgeface} for lightweight face-recognition embeddings.
+
+\textbf{Audio-visual fusion for speaker identity.} Most prior work on
+audio-visual speaker identification targets offline, dataset-level
+fusion, such as re-scoring diarization with ASD or jointly training
+audio-visual embeddings, and reports a single accuracy figure over a
+benchmark of fixed composition. Our setting differs in requiring an
+\emph{online}, segment-by-segment decision under partial observability,
+where a face, a voice match, or both may be missing or unreliable for
+any given segment, which led us to a rule-based, explicitly ordered
+fusion strategy rather than a single learned fusion score.
+
+\textbf{Generalization across deployment conditions.} Benchmarks such
+as AVA-ActiveSpeaker \cite{roth2020ava} and VoxConverse
+\cite{chung2020voxconverse} fix group size and recording conditions by
+construction, so a system's reported accuracy is, by design, an average
+over whatever mixture of conditions the benchmark happens to contain.
+We are not aware of prior work that stratifies a deployed multimodal
+attribution system's behavior by group size or by deployment time to
+test whether a single aggregate figure is representative, which is the
+gap this paper addresses.
+
+\section{System Overview}
+\label{sec:system}
+
+The system runs two cooperating threads sharing an in-memory state
+object. A \emph{video thread} performs face detection (YOLOv8),
+tracking (ByteTrack), face re-identification (EdgeFace), and per-frame
+ASD updates. An \emph{audio thread} performs voice activity detection,
+diarization-based session hints (pyannote.audio), transcription
+(faster-whisper \cite{radford2022whisper}, Portuguese),
+and speaker verification (ECAPA-TDNN) on each detected speech segment,
+querying the video thread's state for currently visible faces and ASD
+results. When diarization indicates more than one concurrent speaker,
+the system applies SepFormer \cite{subakan2021sepformer} speech
+separation before re-verifying each separated stream.
+
+Algorithm~\ref{alg:cascade} summarizes the fusion cascade that
+attributes each segment. Each rule has a different evidence
+requirement, and the cascade stops at the first rule whose precondition
+is satisfied. It prefers voice biometrics whenever the match is
+confident enough, since a voice match is invariant to camera framing
+and remains available for off-camera speakers, and falls back to
+progressively weaker, more circumstantial evidence otherwise. Two
+cross-cutting passes run afterward. A \textbf{gender-consistency check}
+rejects or reroutes visually derived decisions that contradict an
+unambiguous audio-derived gender signal, skipped when voice-biometric
+confidence is very high ($\geq 0.90$). A \textbf{turn-merging} pass
+merges consecutive same-diarization-label segments only if their
+voice-embedding similarity exceeds 0.40, since diarization occasionally
+mislabels two different speakers under the same local cluster.
+
+The two accepted-match tiers in Algorithm~\ref{alg:cascade} are
+separated by the confirmation threshold $\tau_c$, which is configured
+independently of the acceptance threshold $\tau$. The deployment ran at
+$\tau = 0.80$, $\tau_c = 0.70$ for 97\% of segments, and at that
+operating point every accepted match also clears $\tau_c$, so the two
+tiers collapse into one and \textsc{Verifier-Mod} is reached only in a
+small set of sessions configured with a looser $\tau = 0.55$. Because
+this split is an artifact of configuration rather than of evidence
+strength, we report all three verifier tiers together as a single
+voice-led decision family throughout \S\ref{sec:results}.
+
+\begin{algorithm}[h]
+\caption{Speaker attribution cascade (simplified)}
+\label{alg:cascade}
+\begin{algorithmic}[1]
+\STATE $v \gets$ accepted ECAPA match with confidence $c$; accepted only
+  if $c \geq \tau$ and its margin over the runner-up is $\geq 0.07$
+\STATE $r \gets$ best raw ECAPA candidate (name, confidence), accepted or not
+\STATE $g \gets$ audio-derived gender estimate
+\STATE $a \gets$ ASD query over [segment start $-$ 0.4s, end $+$ 0.4s]
+\IF{$v$ is not \textsc{None}, $c \geq \tau_c$, \textbf{and} gender-consistent}
+  \STATE \textbf{return} \textsc{Verifier-High} ($v$.name)
+\ELSIF{$v$ is not \textsc{None} \textbf{and} gender-consistent}
+  \STATE \textbf{return} \textsc{Verifier-Mod} ($v$.name)
+\ELSIF{$r$.conf $\geq 0.65$ \textbf{and} (ASD or gender corroborates)}
+  \STATE \textbf{return} \textsc{Verifier-Weak} ($r$.name)
+\ELSIF{$a$ is not \textsc{None}}
+  \STATE \textbf{return} \textsc{ASD} (face bound to $a$)
+\ELSIF{exactly 1 face visible, known identity, $\leq$1 expected speaker}
+  \STATE \textbf{return} \textsc{Face-Only}
+\ELSIF{exactly 1 face visible, $r$.conf $\geq 0.35$, $\leq$1 expected speaker}
+  \STATE \textbf{return} \textsc{Single-Face} (heuristic)
+\ELSIF{ASD best-guess is dominant ($\geq$1.5$\times$ runner-up)}
+  \STATE \textbf{return} \textsc{ASD-Guess}
+\ELSIF{diarization session hint bound to a known face}
+  \STATE \textbf{return} \textsc{Session-Face}
+\ELSIF{diarization session hint available}
+  \STATE \textbf{return} \textsc{Session-Hint} (anonymous)
+\ELSE
+  \STATE \textbf{return} \textsc{Session-Tracker} (persistent voice cluster)
+\ENDIF
+\STATE \textit{(Gender cross-check / reroute applied as a final pass)}
+\end{algorithmic}
+\end{algorithm}
+
+ASD itself uses a two-backend design, with Light-ASD
+\cite{liao2023lightasd} as the primary backend and a model-free
+pixel-difference fallback for windows in which a neural score is not
+yet available. This design preserves continuous online operation. The
+fallback also rejects occlusion-related motion by requiring the mouth
+region to move at least 1.8$\times$ more than the upper face before the
+motion is treated as speech-related.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+The evaluation uses an internal development dataset collected during
+real, unscripted operation from 16 March to 22 May 2026. A session was
+included when it contained at least one accepted speech segment. This
+criterion retained 92 sessions and 1{,}660 segments; 14 empty sessions
+were excluded before analysis. The sessions were recorded in
+Portuguese with consumer webcam and microphone hardware under varying
+lighting, framing, overlap, and enrollment availability. Their
+configured group-size distribution was 19 one-speaker, 7 two-speaker,
+4 three-speaker, and 62 four-speaker sessions. Processing used one
+machine with an Intel Core i5-11400H, 8\,GB RAM, and an NVIDIA RTX 3060
+Laptop GPU with 6\,GB VRAM.
+
+Audio is captured at 16\,kHz. The first 8\,s of a session form the
+initial processing window; subsequent windows contain 15\,s and advance
+by 5\,s, preserving 10\,s of context while transcribing only the new
+region. pyannote.audio 3.1 receives the configured number of speakers as
+both its minimum and maximum, uses clustering threshold 0.60 and
+segmentation threshold 0.40, and retains turns of at least 0.5\,s. The
+transcription stage uses beam size 5, speech VAD, a 500\,ms minimum
+silence duration, and 300\,ms speech padding. The model configured for
+each retained session was recorded in the database: 87 sessions used
+\texttt{large-v3-turbo}, 3 used \texttt{large-v3}, and 2 used
+\texttt{medium}. This distribution is preserved in the analysis rather
+than treating the deployment as a single-model benchmark.
+
+\begin{table}[h]
+\caption{Principal operating configuration.}
+\begin{center}
+\footnotesize
+\begin{tabular}{ll}
+\hline
+\textbf{Stage} & \textbf{Configuration} \\
+\hline
+Audio & 16\,kHz; 8\,s initial; 15\,s window; 5\,s step \\
+Diarization & pyannote 3.1; 0.60 clustering; 0.40 segmentation \\
+Transcription & faster-whisper; beam 5; VAD enabled \\
+Voice match & $\tau=0.80$ (88 sess.); $0.55$ (4); margin 0.07 \\
+Confirmation & $\tau_c=0.70$ in all 92 sessions \\
+ASD query & speech interval expanded by $\pm0.4$\,s \\
+\hline
+\end{tabular}
+\label{tab:configuration}
+\end{center}
+\end{table}
+
+For every accepted segment, SQLite stores the session identifier,
+segment index, final decision type, identity, raw voice confidence,
+ASD and face indicators, risk flag, speech duration, and transcription,
+verification, and total processing times. We group decisions into five
+families: voice-only, voice with corroboration, active-speaker, face or
+gender, and session context. This segment-level provenance makes each
+aggregate in the results traceable to the rule that produced it.
+
+The five evidence families are mutually exclusive and exhaustive.
+\textsc{Verifier-High} and \textsc{Verifier-Mod} form the voice-only
+family; \textsc{Verifier-Weak} forms voice with corroboration;
+\textsc{ASD} and \textsc{ASD-Guess} form active-speaker evidence;
+face and gender decisions form the visual identity family; and
+\textsc{Session-Face}, \textsc{Session-Hint}, and
+\textsc{Session-Tracker} form session context. This mapping prevents a
+segment from contributing to more than one percentage in the aggregate
+coverage analysis.
+
+For segment $i$, with total processing time $t_i$ in milliseconds and
+speech duration $d_i$ in seconds, the real-time factor is
+\begin{equation}
+    \mathrm{RTF}_i=\frac{t_i}{1000d_i}.
+\end{equation}
+An RTF below 1 means that processing completed faster than the speech
+segment itself. We report the median RTF and the proportion of segments
+with $\mathrm{RTF}<1$, together with stage-level medians.
+
+Identity agreement was evaluated on 330 manually reviewed segments
+from 24 sessions. When more than one review existed for a session, only
+the latest was retained. Exact agreement requires equality between the
+predicted and corrected identity after whitespace and case
+normalization. The named subset excludes anonymous diarization labels.
+Proportions are accompanied by 95\% Wilson intervals
+\cite{wilson1927}; the association between the risk flag and exact
+agreement is tested with a two-sided Fisher exact test at
+$\alpha=0.05$.
+
+DER and WER require time-aligned speaker turns and reference word
+transcripts, respectively \cite{bredin2017metrics}. Those annotations
+were not part of the deployment log, and the fusion cascade neither
+changes the Whisper words nor emits a reference-aligned diarization
+timeline. We therefore report metrics aligned with the evaluated task:
+decision provenance, exact named-identity agreement, and RTF, without
+presenting component metrics as end-to-end attribution scores.
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.92\columnwidth}{\centering\footnotesize
+Audio/video capture $\rightarrow$ diarization, transcription, face and
+ASD processing $\rightarrow$ deterministic fusion cascade $\rightarrow$
+segment-level SQLite log $\rightarrow$ grouped metrics, confidence
+intervals, and human-validation test}}
+\caption{Evaluation flow from multimodal capture to reproducible metrics.}
+\label{fig:evaluation-flow}
+\end{figure}
+
+The anonymous artifact at
+\url{https://github.com/anonimo826/anonimo} contains the system snapshot,
+parameter file, data dictionary, privacy-preserving derived tables, and
+an analysis script that regenerates the counts, Wilson intervals, RTF
+statistics, and Fisher test with one command. The released tables use
+sequential session codes and binary identity-agreement fields; they do
+not contain audio, video, names, transcripts, absolute dates, or
+biometric embeddings. SHA-256 hashes and a manifest allow researchers
+to verify that the analyzed artifacts remain unchanged.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Voice-led resolution is non-monotonic in group size}
+\label{sec:bysize}
+
+Across the whole deployment, voice evidence leads 8.6\% of the 1{,}660
+decisions: 4.0\% are accepted voice matches and 4.6\% are voice matches
+corroborated by ASD or gender. The remaining 91.4\% demonstrate the
+coverage gained from ASD, face re-identification, gender consistency,
+and persistent session context. Table~\ref{tab:byspeakers} stratifies
+the same segments by the configured group size. The
+voice-led rate is not a smooth function of group size, and each value
+has a structural explanation rooted in the cascade itself
+(Algorithm~\ref{alg:cascade}), not merely in how hard voice matching
+happens to be. Single-speaker sessions show a low voice-led rate
+(11.3\%, 95\% CI [5.8, 20.7]) because the cascade's face-identity rules are unlocked
+precisely when at most one speaker is expected, so voice matching is
+rarely the deciding rule even when it would have agreed. Two-speaker
+sessions show the highest voice-led rate observed (39.8\%, 95\% CI
+[31.5, 48.8]), plausibly
+because a two-person voice bank is the easiest case to disambiguate and
+these sessions had the highest proportion of fully enrolled
+participants. Three-speaker sessions lean heavily on the
+gender-consistency layer (23.3\%) and, as Table~\ref{tab:fprisk} shows
+below, also carry the highest self-flagged risk of any group size.
+Four-speaker sessions, which contribute 82\% of all segments, drop to
+the lowest voice-led rate (5.0\%, 95\% CI [3.9, 6.3]) while ASD carries
+the largest share (36.8\%). Together, these results show that the
+cascade adapts its evidence source to session composition and that the
+visual branches are most active in the dominant four-speaker setting.
+
+\begin{table}[h]
+\caption{Decision source by number of expected speakers per session.
+Columns report the three main decision families and do not sum to
+100\%; the balance is carried by the face-only, session-hint and
+session-tracker rules.}
+\begin{center}
+\begin{tabular}{lrrrrr}
+\hline
+\textbf{Speakers} & \textbf{Sess.} & \textbf{Segs.} & \textbf{Voice} & \textbf{ASD} & \textbf{Gender} \\
+\hline
+1 & 19 &   71 & 11.3\% & 16.9\% &  1.4\% \\
+2 &  7 &  118 & 39.8\% & 35.6\% &  0.8\% \\
+3 &  4 &  103 & 19.4\% & 22.3\% & 23.3\% \\
+4 & 62 & 1368 &  5.0\% & 36.8\% &  6.9\% \\
+\hline
+\end{tabular}
+\label{tab:byspeakers}
+\end{center}
+\end{table}
+
+Table~\ref{tab:fprisk} cross-checks this with the self-diagnostic risk
+flag (\S\ref{sec:fprisk}). The risk rate is also non-monotonic and
+peaks at three speakers (68.9\%), well above both its
+neighbors, matching the group size where the gender-safety layer had
+to work hardest in Table~\ref{tab:byspeakers}. Three-speaker meetings
+therefore receive the highest review priority from the monitor. This
+behavior is consistent with the strong participation of the
+gender-consistency layer in the same group.
+
+\begin{table}[h]
+\caption{Self-flagged review-priority rate by expected speakers.}
+\begin{center}
+\begin{tabular}{lrrr}
+\hline
+\textbf{Speakers} & \textbf{Sess.} & \textbf{Segments} & \textbf{Flagged \%} \\
+\hline
+1 & 19 &   71 & 23.9\% \\
+2 &  7 &  118 &  5.9\% \\
+3 &  4 &  103 & 68.9\% \\
+4 & 62 & 1368 & 28.1\% \\
+\hline
+\end{tabular}
+\label{tab:fprisk}
+\end{center}
+\end{table}
+
+\subsection{Apparent temporal decline is a composition effect}
+\label{sec:bytime}
+
+A naive reading of the deployment log by calendar week shows what
+looks like a steep decline in voice-led resolution. Voice-led
+decisions accounted for 37--42\% of segments in the first two weeks,
+falling to 0--2\% in the final three weeks recorded. Read on its own,
+this trend invites a misleading story, namely that voice matching
+degraded as the deployment progressed.
+
+Breaking down the same weeks by session composition rules this out.
+The first two weeks were composed entirely of one- and two-speaker
+sessions (100\% in each week), the group sizes Table~\ref{tab:byspeakers}
+identifies as having the highest voice-led rates. From the third week
+onward, the deployment shifted to sessions with three or four expected
+speakers, reaching 90\% four-speaker segments in the third week and
+staying above 80\% in every subsequent week with more than 100
+segments. The decline in voice-led resolution over time is, to a
+substantial degree, the same non-monotonic group-size effect from
+\S\ref{sec:bysize} appearing again under a different label, because the
+deployment's session mix changed, not because voice biometrics got
+worse at its job.
+
+The self-flagged risk rate over the same weeks makes the point a
+second time, and in the opposite direction. It was zero in the first
+two weeks, rose to 39\% and then 52\% as multi-speaker sessions came to
+dominate, and fell back to 14\% in the final week. Read as a time
+series alone, the rise and the fall would each invite a story about the
+system changing. Both are largely the composition shift again, with the
+final-week drop additionally consistent with threshold and gender-check
+refinements made late in the period, a genuine improvement running in
+parallel with, and partly obscured by, that shift. We take this as a
+methodological caution. A raw trend line
+over a real deployment log can be confounded by what the deployment
+happened to contain in each period, and stratifying by a plausible
+confounder, here group size, before drawing conclusions from time alone
+is necessary, not optional.
+
+\subsection{Real-time performance}
+
+The cascade processed 1{,}488 of 1{,}660 segments (89.6\%) faster than
+real time, with median RTF 0.24. Median total processing time was
+633.1\,ms per segment; transcription accounted for 513.6\,ms and voice
+verification for 29.7\,ms. These measurements show that multimodal
+attribution remains compatible with live meeting operation on a single
+consumer laptop GPU.
+
+\subsection{ASD backend accuracy against the published literature}
+\label{sec:columbia}
+
+The ASD backend is used exactly as released, with no retraining or
+fine-tuning on our data, so the figures its authors report describe the
+same weights that run in our pipeline. The pretrained Light-ASD
+checkpoint we use is reported by its authors to
+reach 94.06\% mAP on the AVA-ActiveSpeaker validation set and an
+average F1 of 81.1\% on the Columbia ASD dataset
+\cite{chakravarty2016columbia}, a small, five-panelist benchmark widely
+used for out-of-domain ASD evaluation \cite{liao2023lightasd}. Both are
+fixed-composition benchmarks of the kind this paper's stratified
+deployment analysis is meant to complement, and neither speaks to how
+often ASD is the rule that decides an identity, which is what
+Table~\ref{tab:byspeakers} measures.
+
+\subsection{Statistical validation of the review-priority monitor}
+\label{sec:fprisk}
+
+Independently of the cascade, the system computes a rule-based risk
+flag for every segment that received a named identity. Four factors
+raise it. A decision of a structurally weak type
+(\textsc{Verifier-Weak}, \textsc{Face-Only}, \textsc{Single-Face})
+raises its review priority, as does the number of distinct identified speakers
+in the session exceeding the configured expected count. A name drawn
+from the enrolled voice bank whose raw voice confidence never reached
+the acceptance threshold $\tau$ receives high priority, as does a
+contradiction between the attributed name's gender and the
+audio-derived gender estimate. The monitor is a deterministic function
+of decision metadata and therefore operates without labels. Across the
+deployment, 479 of 1{,}660 segments (28.9\%) were flagged for priority
+review.
+
+The human-reviewed subset confirms that this prioritization is
+informative. Among named decisions, 9 of 11 unflagged cases agreed with
+the human correction (81.8\%, Wilson 95\% CI [52.3, 94.9]), compared
+with 28 of 113 flagged cases (24.8\%, 95\% CI [17.7, 33.5]). Fisher's
+exact test rejects independence between the flag and exact agreement
+($p=2.94\times10^{-4}$). Thus, the monitor identifies a substantially
+different review-priority group and provides a practical way to focus
+human verification effort.
+
+\section{Discussion}
+
+The results support a condition-aware view of multimodal attribution.
+The same cascade moves naturally between voice, ASD, face, and session
+context as group composition changes. This is particularly valuable in
+four-speaker sessions, which represent 82.4\% of the evaluated
+segments: visual or session evidence participates in 95.0\% of their
+decisions, preserving coverage when voice alone is not decisive.
+
+The combination of traceable decision rules, a statistically validated
+review-priority monitor, and real-time execution offers three practical
+benefits. Each identity can be audited back to its evidence source,
+segments can be ranked for efficient human review, and the complete
+analysis can be regenerated from privacy-preserving tables. These
+properties make the system a reproducible foundation for future
+condition-aware threshold selection and larger annotated evaluations.
+
+\section{Conclusion}
+
+In 92 real meeting sessions and 1{,}660 speech segments, the system
+combined complementary modalities while sustaining real-time operation
+for 89.6\% of segments. Voice-led decisions ranged from 5\% to 40\%
+across group sizes, demonstrating why deployment composition should be
+reported together with aggregate coverage. The review-priority monitor
+also separated named decisions with 81.8\% and 24.8\% exact agreement
+($p<0.001$), turning decision metadata into an effective aid for human
+verification. Overall, the deterministic cascade provides broad
+coverage, traceable decisions, real-time execution, and a reproducible
+evaluation path for multimodal meeting intelligence.
+
+% ---------------------------------------------------------------------
+% CAMERA-READY ONLY. Do NOT uncomment before acceptance: the WVC CFP
+% requires that no identifying information appear in the blind
+% submission, and this text names the collaborating institutions.
+% Adapted from the Portuguese "Agradecimentos" of the companion CONICT
+% submission (paper/conict/main.tex), which must stay anonymous for the
+% same reason until its own final version.
+%
+% Replace the paragraph above with:
+%
+% The authors thank the CEPIN-CIS research center, the IT University of
+% Copenhagen, and the researchers at GN Group for making this study
+% possible, and for the technical support and resources that were
+% essential to carrying it out. We also thank everyone who contributed,
+% directly or indirectly, to this work.
+%
+% NOTE: write out "IT University of Copenhagen" rather than the bare
+% acronym ITU, which an international audience will read as the
+% International Telecommunication Union.
+% ---------------------------------------------------------------------
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

@@ -1,0 +1,12 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+*.npy
+*.wav
+*.mp3
+*.m4a
+*.mp4
+__pycache__/
+pretrained_models/
+od_model/
