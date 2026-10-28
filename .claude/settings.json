@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"C:/Users/manu/av-tracker/\"*.cfg \"C:/Users/manu/av-tracker/\"*.toml \"C:/Users/manu/av-tracker/\"*.txt)",
+      "Read(//c/Users/manu/anaconda3/**)",
+      "Read(//c/Users/manu/miniconda3/**)",
+      "Read(//c/ProgramData/anaconda3/**)",
+      "Bash(ls \"/c/Python*/python.exe\")",
+      "Bash(\"C:/Users/manu/miniconda3/python.exe\" -c \"import py_compile; py_compile.compile\\(''C:/Users/manu/av-tracker/src/realtime_transcriber.py'', doraise=True\\); print\\(''Syntax OK''\\)\")",
+      "Bash(ls -la \"c:\\\\Users\\\\manu\\\\av-tracker\"/*.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''scripts/plot_metrics.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(py -c \"import ast; ast.parse\\(open\\(''scripts/plot_metrics.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(py -c \"import ast; ast.parse\\(open\\(''src/realtime_transcriber.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(where python3:*)",
+      "Bash(where py:*)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''scripts/plot_metrics.py''\\).read\\(\\)\\); print\\(''plot_metrics OK''\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''src/realtime_transcriber.py''\\).read\\(\\)\\); print\\(''realtime_transcriber OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/personid_tracker.py''\\).read\\(\\)\\); print\\(''personid_tracker OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''scripts/plot_metrics.py''\\).read\\(\\)\\); print\\(''plot_metrics OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/realtime_transcriber.py''\\).read\\(\\)\\); print\\(''realtime_transcriber OK''\\)\")",
+      "Bash(ls -lt c:/Users/manu/av-tracker/realtime_sessions/log_*.txt)"
+    ]
+  }
+}

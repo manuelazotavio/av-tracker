@@ -1,0 +1,5 @@
+expected_participants,segments,voice_only,voice_only_percentage,voice_corroborated,voice_corroborated_percentage,multimodal_or_context,multimodal_or_context_percentage
+1,71,2,2.817,6,8.451,63,88.732
+2,118,17,14.407,30,25.424,71,60.169
+3,103,6,5.825,14,13.592,83,80.583
+4,1368,42,3.07,26,1.901,1300,95.029

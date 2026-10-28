@@ -1,688 +1,680 @@
-#!/usr/bin/env python3
-"""
-Multi-Speaker Real-Time Verification System
-==========================================
+import sys
+from types import ModuleType
 
-Advanced verification system for identifying multiple known speakers in 
-real-time audio streams. Part of the PyAnnote multi-modal speaker recognition 
-ecosystem with comprehensive speaker database support.
+sys.modules['k2'] = ModuleType('k2')
+sys.modules['_k2'] = ModuleType('_k2')
+sys.modules['speechbrain.integrations.k2_fsa'] = ModuleType('speechbrain.integrations.k2_fsa')
 
-Features:
-- Multi-speaker simultaneous verification
-- Real-time microphone and file processing
-- High-quality audio resampling
-- Comprehensive logging and monitoring
-- Configurable similarity thresholds
-- Professional error handling and recovery
-
-Author: DevAgent Collaborative Development
-Created: December 18, 2024 (Refactored: September 8, 2025)
-Environment: pyannote-speaker-recognition
-Dependencies: PyTorch, PyAnnote, SpeechBrain, SoundDevice, SciPy
-"""
-
-import numpy as np
-import sounddevice as sd
-import wave
-import torch
-import pickle
-import queue
-import threading
-import datetime
 import os
+import torch
+from pyannote.audio import Pipeline
+from speechbrain.inference.separation import SepformerSeparation
 import logging
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Union
-from scipy.spatial.distance import cosine
-from scipy import signal
-from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+import numpy as np
+import torchaudio
+import re
+import torchaudio.transforms as T
+from faster_whisper import WhisperModel
+from .multi_speaker_verifier import MultiSpeakerVerifier
+from huggingface_hub import login, snapshot_download
+from difflib import SequenceMatcher
+from collections import defaultdict
+from datetime import datetime
+import time
+import spacy
+from transformers import pipeline as hf_pipeline
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+from pyannote.audio.core.task import Specifications, Problem, Resolution
+
+torch.serialization.add_safe_globals([
+    torch.torch_version.TorchVersion,
+    Specifications,
+    Problem,
+    Resolution
+])
+
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Constants
-DEFAULT_THRESHOLD = 0.5
-DEFAULT_CHUNK_DURATION = 3.0  # seconds
-DEFAULT_TARGET_SAMPLE_RATE = 16000
-MIN_AUDIO_LEVEL = 0.001
-MODEL_NAME = "speechbrain/spkrec-ecapa-voxceleb"
-UNKNOWN_SPEAKER = "Unknown"
-RESAMPLING_WINDOW = ('kaiser', 5.0)
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+logging.getLogger("pyannote").setLevel(logging.WARNING)
 
-
-class SpeakerProfile:
-    """Data class to hold speaker profile information"""
-    
-    def __init__(self, name: str, embedding: np.ndarray, filename: str, 
-                 quality_score: float = 0.0, metadata: Dict[str, Any] = None):
-        self.name = name
-        self.embedding = embedding
-        self.filename = filename
-        self.quality_score = quality_score
-        self.metadata = metadata or {}
-    
-    def __repr__(self) -> str:
-        return f"SpeakerProfile(name='{self.name}', quality={self.quality_score:.3f})"
-
-
-class MultiSpeakerVerifier:
-    """
-    Multi-speaker verification system for real-time speaker identification
-    
-    This class provides comprehensive speaker verification against multiple known
-    speaker profiles, with support for real-time microphone input and audio file
-    processing.
-    """
-    
-    def __init__(self, 
-                 embedding_directory: str,
-                 threshold: float = DEFAULT_THRESHOLD,
-                 target_sample_rate: int = DEFAULT_TARGET_SAMPLE_RATE,
-                 chunk_duration: float = DEFAULT_CHUNK_DURATION) -> None:
-        """
-        Initialize the multi-speaker verifier
+class LargeMeetingTranscriber:
+    def __init__(
+        self,
+        verifier,
+        hf_token,
+        whisper_size="small",
+        device="cuda",
+        use_ai_analysis=True,
+        diarization_clustering_threshold=0.6,
+        verifier_confidence_min=0.8,
+        min_segment_duration=0.8,
+    ):
+        self.verifier = verifier
+        self.device = device
+        self.use_ai_analysis = use_ai_analysis
+        self.diarization_clustering_threshold = diarization_clustering_threshold
+        self.verifier_confidence_min = verifier_confidence_min
+        self.min_segment_duration = min_segment_duration
         
-        Args:
-            embedding_directory: Directory containing speaker embedding files (.pkl)
-            threshold: Similarity threshold for verification (0.0-1.0)
-            target_sample_rate: Required sample rate for the model (Hz)
-            chunk_duration: Duration of audio chunks for processing (seconds)
-            
-        Raises:
-            FileNotFoundError: If embedding directory doesn't exist
-            ValueError: If threshold is out of valid range
-            RuntimeError: If no valid speaker profiles found or model fails to load
-        """
-        logger.info(f"Initializing MultiSpeakerVerifier from {embedding_directory}")
+        logger.info("Authenticating...")
+        login(token=hf_token)
         
-        # Validate inputs
-        if not os.path.exists(embedding_directory):
-            raise FileNotFoundError(f"Embedding directory not found: {embedding_directory}")
-        
-        if not 0.0 <= threshold <= 1.0:
-            raise ValueError(f"Threshold must be between 0.0 and 1.0, got {threshold}")
-        
-        # Store configuration
-        self.embedding_directory = embedding_directory
-        self.threshold = threshold
-        self.target_sample_rate = target_sample_rate
-        self.chunk_duration = chunk_duration
-        self.chunk_samples = int(target_sample_rate * chunk_duration)
-        
-        # Load speaker profiles
-        self.speakers = self._load_speaker_embeddings(embedding_directory)
-        if not self.speakers:
-            raise RuntimeError(f"No valid speaker profiles found in {embedding_directory}")
-        
-        logger.info(f"Loaded {len(self.speakers)} speaker profiles")
-        
-        # Initialize embedding model
-        self._initialize_embedding_model()
-        
-        # Initialize processing components
-        self.audio_queue: queue.Queue = queue.Queue()
-        self.is_running = False
-        self.processing_thread: Optional[threading.Thread] = None
-        self.session_start_time = datetime.datetime.now()
-        
-        # Initialize results logging
-        self._initialize_logging()
-        
-        logger.info("MultiSpeakerVerifier initialized successfully")
-    
-    def _initialize_embedding_model(self) -> None:
-        """Initialize the SpeechBrain embedding model"""
-        try:
-            logger.info(f"Loading embedding model: {MODEL_NAME}")
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            logger.info(f"Using device: {device}")
-            
-            self.embedding_model = PretrainedSpeakerEmbedding(
-                MODEL_NAME,
-                device=device
-            )
-            
-            logger.info("Embedding model loaded successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to load embedding model: {e}")
-            raise RuntimeError(f"Could not initialize embedding model: {e}")
-    
-    def _initialize_logging(self) -> None:
-        """Initialize results logging"""
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Create logs directory if it doesn't exist
-        logs_dir = Path("logs")
-        logs_dir.mkdir(exist_ok=True)
-        
-        self.results_file = logs_dir / f"multi_speaker_results_{timestamp}.txt"
-        
-        try:
-            with open(self.results_file, 'w', encoding='utf-8') as f:
-                f.write(f"=== Multi-Speaker Verification Session ===\n")
-                f.write(f"Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Speakers loaded: {len(self.speakers)}\n")
-                f.write(f"Speaker names: {', '.join([speaker.name for speaker in self.speakers])}\n")
-                f.write(f"Threshold: {self.threshold}\n")
-                f.write(f"Sample Rate: {self.target_sample_rate} Hz\n")
-                f.write("=" * 50 + "\n\n")
-            
-            logger.info(f"Results will be logged to: {self.results_file}")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize logging: {e}")
-            raise RuntimeError(f"Could not initialize logging: {e}")
-    
-    def resample_audio(self, audio_data: np.ndarray, original_sample_rate: int) -> np.ndarray:
-        """
-        Resample audio to target sample rate using high-quality resampling
-        
-        Args:
-            audio_data: Audio samples as numpy array
-            original_sample_rate: Original sample rate of the audio (Hz)
-            
-        Returns:
-            Resampled audio data
-            
-        Raises:
-            ValueError: If sample rates are invalid
-        """
-        if original_sample_rate <= 0 or self.target_sample_rate <= 0:
-            raise ValueError("Sample rates must be positive")
-        
-        if original_sample_rate == self.target_sample_rate:
-            return audio_data
-        
-        try:
-            logger.debug(f"Resampling from {original_sample_rate}Hz to {self.target_sample_rate}Hz")
-            
-            # Use high-quality polyphase filtering
-            resampled = signal.resample_poly(
-                audio_data,
-                up=self.target_sample_rate,
-                down=original_sample_rate,
-                window=RESAMPLING_WINDOW
-            )
-            
-            return resampled.astype(np.float32)
-            
-        except Exception as e:
-            logger.error(f"Error resampling audio: {e}")
-            raise RuntimeError(f"Failed to resample audio: {e}")
-    
-    def _load_speaker_embeddings(self, directory: str) -> List[SpeakerProfile]:
-        """
-        Load all speaker embeddings from the specified directory
-        
-        Args:
-            directory: Path to directory containing .pkl embedding files
-            
-        Returns:
-            List of SpeakerProfile objects
-        """
-        speakers = []
-        directory_path = Path(directory)
-        
-        for filepath in directory_path.glob("*.pkl"):
+        if use_ai_analysis:
+            logger.info("Loading NER model (spaCy)...")
             try:
-                logger.debug(f"Loading profile: {filepath.name}")
+                self.nlp = spacy.load("pt_core_news_lg")
+            except OSError:
+                logger.warning("Model pt_core_news_lg not found. Trying pt_core_news_sm...")
+                try:
+                    self.nlp = spacy.load("pt_core_news_sm")
+                except OSError:
+                    logger.warning("spaCy not available. Install with: python -m spacy download pt_core_news_sm")
+                    self.nlp = None
+            
+            logger.info("Loading LLM for contextual analysis...")
+            try:
+                self.llm = hf_pipeline(
+                    model="google/flan-t5-small",
+                    device=0 if device == "cuda" else -1,
+                    max_length=512
+                )
+            except Exception as e:
+                logger.warning(f"LLM not available: {e}")
+                self.llm = None
+        else:
+            self.nlp = None
+            self.llm = None
+
+        logger.info("Loading PyAnnote...")
+        self.pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1"
+        ).to(torch.device(device))
+
+        if self.diarization_clustering_threshold is not None:
+            try:
+                self.pipeline.instantiate({
+                    "clustering": {"threshold": self.diarization_clustering_threshold},
+                    "segmentation": {"threshold": 0.4} 
+                })
+                logger.info(
+                    f"Clustering threshold set: {self.diarization_clustering_threshold}"
+                )
+                logger.info("Segmentation threshold set: 0.4")
+            except Exception as e:
+                logger.warning(f"Failed to set thresholds: {e}")
+
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+        logger.info("Loading SepFormer...")
+        local_path = "pretrained_models/sepformer"
+        sepformer_source = local_path
+        if not os.path.exists(os.path.join(local_path, "hyperparams.yaml")):
+            logger.warning("Local SepFormer not found. Downloading model...")
+            snapshot_download(
+                repo_id="speechbrain/sepformer-whamr",
+                local_dir=local_path,
+                local_dir_use_symlinks=False
+            )
+            sepformer_source = local_path
+
+        self.separator = SepformerSeparation.from_hparams(
+            source=sepformer_source,
+            savedir=local_path,
+            run_opts={"device": device}
+        )
+
+        logger.info(f"Loading Whisper ({whisper_size})...")
+        try:
+            self.whisper = WhisperModel(whisper_size, device="cpu", compute_type="float16")
+            logger.info("Using compute_type: float16")
+        except Exception as e:
+            logger.warning(f"float16 not supported ({e}), using int8...")
+            self.whisper = WhisperModel(whisper_size, device="cpu", compute_type="int8")
+            logger.info("Using compute_type: int8")
+
+    def normalize_text(self, text):
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', '', text)
+        return text.strip()
+    
+    def normalize_audio(self, audio, target_db=-20.0):
+        if len(audio) == 0:
+            return audio
+        
+        rms = np.sqrt(np.mean(audio**2))
+        if rms < 1e-6:
+            return audio
+        
+        target_amplitude = 10**(target_db/20.0)
+        scaling_factor = target_amplitude / rms
+        normalized = (audio * scaling_factor).astype(np.float32)
+        
+        max_val = np.abs(normalized).max()
+        if max_val > 1.0:
+            normalized = normalized / max_val
+        
+        return normalized
+    
+    def extract_names_with_ner(self, text):
+        if not self.nlp:
+            return []
+        
+        doc = self.nlp(text)
+        names = []
+        
+        for ent in doc.ents:
+            if ent.label_ == "PER": 
+                name = ent.text.strip()
+                name = re.sub(r'^(Sr\.|Sra\.|Dr\.|Dra\.)\s+', '', name, flags=re.IGNORECASE)
+                if len(name) > 2:
+                    names.append(name)
+        
+        return names
+    
+    def analyze_conversation_context_with_llm(self, transcript):
+        if not self.llm or len(transcript) == 0:
+            return {}
+        
+        conversation_text = ""
+        for entry in transcript[:20]: 
+            speaker = entry['speaker']
+            text = entry['text']
+            conversation_text += f"{speaker}: {text}\n"
+        
+        prompt = f"""Analyze this English conversation and identify the REAL HUMAN NAME of each speaker.
+
+IMPORTANT RULES:
+- Only extract actual person names 
+- IGNORE programming languages (Kotlin, Java, Python, etc.)
+- IGNORE technical terms, frameworks, or companies
+- IGNORE product names or technologies
+- When someone says "PersonName, ..." at start of sentence, they are ADDRESSING that person
+- When someone says "my name is PersonName" they are introducing themselves
+
+Conversation:
+{conversation_text}
+
+For each speaker that you can identify a real human name, write:
+SPEAKER_XX=ActualHumanName
+
+Answer (only list speakers with confirmed human names):"""
+        
+        try:
+            result = self.llm(prompt, max_length=200, do_sample=False)
+            response = result[0]['generated_text']
+            
+            speaker_names = {}
+            invalid_names = {'name', 'another', 'person', 'speaker', 'someone', 'user', 'kotlin', 'java', 'python'}
+            
+            matches = re.findall(r'(SPEAKER_\d+)\s*=\s*([A-ZÀ-Ú][a-zà-ú]+)', response)
+            for speaker_id, name in matches:
+                if name.lower() not in invalid_names and len(name) >= 3:
+                    speaker_names[speaker_id] = name
+                    logger.info(f"LLM detected: {speaker_id} = {name}")
+                else:
+                    logger.debug(f"LLM returned invalid name: {name}")
+            
+            return speaker_names
+        except Exception as e:
+            logger.warning(f"LLM analysis error: {e}")
+            return {}
+    
+    def associate_names_with_speakers(self, transcript):
+        speaker_names = {}
+        
+        if self.llm:
+            llm_names = self.analyze_conversation_context_with_llm(transcript)
+            speaker_names.update(llm_names)
+        
+        speaker_mentions = defaultdict(lambda: defaultdict(int)) 
+        vocative_mentions = defaultdict(lambda: defaultdict(int)) 
+        self_introductions = {} 
+        
+        for i, entry in enumerate(transcript):
+            speaker = entry['speaker']
+            text = entry['text']
+            
+            # Portuguese self-introduction patterns:
+            # "meu nome é" = "my name is", "me chamo" = "I'm called",
+            # "eu sou" = "I am", "sou o/sou a" = "I am (masc/fem)"
+            # "aqui é" = "this is", "aqui quem fala é" = "the one speaking here is"
+            self_intro_patterns = [
+                r'(?:meu nome é|me chamo|eu sou|sou o|sou a)\s+([A-ZÀ-Ú][a-zà-ú]+)',
+                r'(?:aqui é|aqui quem fala é)\s+(?:o|a)?\s*([A-ZÀ-Ú][a-zà-ú]+)',
+            ]
+            
+            for pattern in self_intro_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    name = match.group(1).capitalize()
+                    self_introductions[speaker] = name
+                    logger.info(f"Self-introduction: {speaker} = {name}")
+            
+            detected_names = []
+            if self.nlp:
+                detected_names = self.extract_names_with_ner(text)
+                if detected_names:
+                    logger.debug(f"NER extracted from '{text[:50]}...': {detected_names}")
+            
+            regex_name_pattern = r'^\s*([A-ZÀ-Ú][a-zà-úç]{2,15})\s*[,!]'
+            regex_match = re.search(regex_name_pattern, text)
+            if regex_match:
+                potential_name = regex_match.group(1)
+                common_names = {
+                    'lucas', 'mateus', 'pedro', 'joão', 'gabriel', 'rafael', 'bruno', 'carlos', 'andré',
+                    'fernando', 'ricardo', 'rodrigo', 'marcelo', 'paulo', 'thiago', 'vitor', 'daniel',
+                    'maria', 'ana', 'julia', 'beatriz', 'leticia', 'amanda', 'carolina', 'fernanda',
+                    'mariana', 'juliana', 'patricia', 'camila', 'bruna', 'aline', 'bianca', 'renata',
+                    'augusto', 'leonardo', 'eduardo', 'henrique', 'diego', 'felipe', 'guilherme', 'manuela', 'kauan'
+                }
+                tech_terms = {'kotlin', 'java', 'python', 'javascript', 'react', 'typescript', 'node'}
                 
-                with open(filepath, 'rb') as f:
-                    data = pickle.load(f)
+                if potential_name.lower() in common_names and potential_name.lower() not in tech_terms:
+                    if potential_name not in detected_names:
+                        detected_names.append(potential_name)
+                        logger.debug(f"Regex detected name: '{potential_name}' in '{text[:50]}...'")
+
+            for name in detected_names:
+                vocative_pattern = rf'^\s*{re.escape(name)}\s*[,!]'
+                if re.search(vocative_pattern, text, re.IGNORECASE):
+                    target_speaker = None
+                    
+                    if i + 1 < len(transcript):
+                        target_speaker = transcript[i + 1]['speaker']
+                        logger.info(f"Vocative detected: '{name}' in '{text[:60]}...' -> next speaker is {target_speaker}")
+                    else:
+                        all_speakers = set(e['speaker'] for e in transcript)
+                        other_speakers = all_speakers - {speaker}
+                        if len(other_speakers) == 1:
+                            target_speaker = list(other_speakers)[0]
+                            logger.info(f"Vocative detected (last turn): '{name}' in '{text[:60]}...' -> other speaker is {target_speaker}")
+                        elif len(other_speakers) > 1:
+                            for j in range(i - 1, -1, -1):
+                                if transcript[j]['speaker'] != speaker:
+                                    target_speaker = transcript[j]['speaker']
+                                    logger.info(f"Vocative detected: '{name}' in '{text[:60]}...' -> previous speaker is {target_speaker}")
+                                    break
+                    
+                    if target_speaker:
+                        vocative_mentions[name][target_speaker] += 2 
+                else:
+                    if i + 1 < len(transcript):
+                        next_speaker = transcript[i + 1]['speaker']
+                        speaker_mentions[name][next_speaker] += 1
+        
+        speaker_names.update(self_introductions)
+        
+        for name, responding_speakers in vocative_mentions.items():
+            if responding_speakers:
+                most_likely_speaker = max(responding_speakers.items(), key=lambda x: x[1])[0]
+                if most_likely_speaker not in speaker_names:
+                    speaker_names[most_likely_speaker] = name
+                    logger.info(f"Vocative: {most_likely_speaker} = {name} (called {responding_speakers[most_likely_speaker]}x)")
+        
+        invalid_terms = {'kotlin', 'java', 'python', 'javascript', 'react', 'angular', 'node'}
+        for name, responding_speakers in speaker_mentions.items():
+            if responding_speakers and name.lower() not in invalid_terms:
+                most_likely_speaker = max(responding_speakers.items(), key=lambda x: x[1])[0]
+                if most_likely_speaker not in speaker_names:
+                    if responding_speakers[most_likely_speaker] >= 2:
+                        speaker_names[most_likely_speaker] = name
+                        logger.info(f"Contextual: {most_likely_speaker} = {name} (mentioned {responding_speakers[most_likely_speaker]}x before responding)")
+        
+        return speaker_names
+    
+    def save_new_embeddings(self, unknown_speakers_audio, speaker_names, embeddings_dir):
+        from speechbrain.inference.speaker import EncoderClassifier
+        
+        if not unknown_speakers_audio:
+            return
+        
+        logger.info("\nCreating embeddings for new speakers...")
+        
+        classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": self.device}
+        )
+        
+        saved_count = 0
+        
+        for speaker_id, audio_chunks in unknown_speakers_audio.items():
+            actual_name = speaker_names.get(speaker_id, None)
+            
+            if not actual_name:
+                logger.info(f"{speaker_id}: No name detected, skipping...")
+                continue
+            
+            if len(audio_chunks) == 0:
+                continue
                 
-                # Validate required fields
-                if 'speaker_name' not in data or 'embedding' not in data:
-                    logger.warning(f"Missing required fields in {filepath.name}")
+            combined_audio = np.concatenate(audio_chunks)
+            
+            mx = np.abs(combined_audio).max()
+            if mx > 0:
+                combined_audio = combined_audio / mx
+            
+            signal = torch.from_numpy(combined_audio).float().to(self.device)
+            if signal.dim() == 1:
+                signal = signal.unsqueeze(0)
+            
+            with torch.no_grad():
+                embedding = classifier.encode_batch(signal).squeeze().cpu().numpy()
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{actual_name}_{timestamp}.npy"
+            filepath = os.path.join(embeddings_dir, filename)
+            
+            np.save(filepath, embedding)
+            logger.info(f"Saved: {filepath}")
+            saved_count += 1
+        
+        if saved_count > 0:
+            logger.info(f"\n{saved_count} new embedding(s) created successfully!")
+            logger.info("Restart the system to load new embeddings.")
+
+    def process_audio(self, audio_path, embeddings_dir=None, num_speakers=None):
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"File not found: {audio_path}")
+        
+        start_total = time.time()
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing: {audio_path}")
+        if num_speakers:
+            logger.info(f"Limiting to MAXIMUM {num_speakers} speaker(s)")
+        logger.info(f"{'='*60}")
+        
+        start = time.time()
+        waveform, sample_rate = torchaudio.load(audio_path)
+        elapsed = time.time() - start
+        logger.info(f"Audio loading: {elapsed:.2f}s")
+        
+        start = time.time()
+        diarization_params = {}
+        if num_speakers:
+            diarization_params['min_speakers'] = num_speakers
+            diarization_params['max_speakers'] = num_speakers
+        
+        diarization = self.pipeline(audio_path, **diarization_params)
+        overlap_timeline = diarization.get_overlap()
+        elapsed = time.time() - start
+        logger.info(f"Diarization (speaker identification): {elapsed:.2f}s")
+        
+        resample_to_8k = T.Resample(sample_rate, 8000)
+        resample_to_16k = T.Resample(8000, 16000)
+        resample_orig_to_16k = T.Resample(sample_rate, 16000)
+        
+        full_transcript = []
+        speaker_history = {}
+        unknown_speakers_audio = defaultdict(list) 
+        
+        total_segments = 0
+        transcribed_segments = 0
+        
+        start_transcription = time.time()
+        logger.info("\nTranscribing segments...")
+
+        for turn, _, speaker_id in diarization.itertracks(yield_label=True):
+            duration = turn.end - turn.start
+            
+            if duration < self.min_segment_duration:
+                logger.debug(
+                    f"[{turn.start:.1f}s] Segment too short ({duration:.2f}s), skipping..."
+                )
+                continue
+            
+            effective_end = turn.end
+            if duration > 30.0:
+                logger.debug(f"[{turn.start:.1f}s] Segment too long ({duration:.2f}s), limiting to 30s...")
+                effective_end = turn.start + 30.0
+            
+            total_segments += 1
+            logger.debug(f"[{turn.start:.1f}s - {effective_end:.1f}s] Processing {speaker_id} ({effective_end - turn.start:.2f}s)")
+            
+            start_frame = int(turn.start * sample_rate)
+            end_frame = int(effective_end * sample_rate)
+            if start_frame >= waveform.shape[1]:
+                logger.debug(f"[{turn.start:.1f}s] Frame out of bounds, skipping...")
+                continue
+            
+            audio_segment = waveform[:, start_frame:end_frame]
+            
+            overlap_duration = 0.0
+            for ov in overlap_timeline:
+                inter = turn & ov
+                if inter:
+                    overlap_duration += inter.duration
+            is_overlap = (overlap_duration / (turn.end - turn.start)) > 0.30
+
+            sources_to_transcribe = []
+
+            if is_overlap:
+                start_sep = time.time()
+                logger.info(f"Overlap at {turn.start:.1f}s. Separating...")
+                mono = torch.mean(audio_segment, dim=0) if audio_segment.shape[0] > 1 else audio_segment.squeeze(0)
+                mono_8k = resample_to_8k(mono)
+                mono_8k_input = mono_8k.unsqueeze(0)
+
+                try:
+                    est_sources = self.separator.separate_batch(mono_8k_input)
+                    src1_8k = est_sources[0, :, 0].detach().cpu()
+                    src2_8k = est_sources[0, :, 1].detach().cpu()
+
+                    src1_16k = resample_to_16k(src1_8k).numpy()
+                    src2_16k = resample_to_16k(src2_8k).numpy()
+                    
+                    sources_to_transcribe = [src1_16k, src2_16k]
+                    elapsed_sep = time.time() - start_sep
+                    logger.info(f"Separation: {elapsed_sep:.2f}s")
+                except Exception as e:
+                    logger.error(f"Separation failed: {e}. Using original audio.")
+                    sources_to_transcribe = [resample_orig_to_16k(audio_segment).squeeze().numpy()]
+            else:
+                audio_16k = resample_orig_to_16k(audio_segment)
+                sources_to_transcribe = [audio_16k.squeeze().numpy()]
+
+            for idx, source_np in enumerate(sources_to_transcribe):
+                source_np = source_np.squeeze()
+                
+                if source_np.ndim == 2:
+                    logger.debug(f"Converting stereo to mono...")
+                    source_np = np.mean(source_np, axis=0)
+                
+                if source_np.ndim != 1 or source_np.size == 0:
+                    logger.debug(f"[{turn.start:.1f}s] Voice {idx+1}: Invalid audio (ndim={source_np.ndim}, size={source_np.size}), skipping...")
                     continue
                 
-                # Extract metadata
-                quality_score = 0.0
-                if 'metadata' in data and isinstance(data['metadata'], dict):
-                    quality_score = data['metadata'].get('audio_quality_score', 0.0)
+                mx = np.abs(source_np).max()
+                if np.isnan(mx) or mx == 0:
+                    logger.debug(f"[{turn.start:.1f}s] Voice {idx+1}: Silent audio (max={mx}), skipping...")
+                    continue
+                source_np = source_np / mx
                 
-                # Create speaker profile
-                profile = SpeakerProfile(
-                    name=data['speaker_name'],
-                    embedding=data['embedding'],
-                    filename=filepath.name,
-                    quality_score=float(quality_score),
-                    metadata=data.get('metadata', {})
-                )
+                real_name, conf = self.verifier._process_audio_chunk(source_np, sample_rate=16000)
                 
-                speakers.append(profile)
-                logger.debug(f"Loaded profile for {profile.name} (quality: {profile.quality_score:.3f})")
+                if real_name == "Unknown":
+                    unknown_speakers_audio[speaker_id].append(source_np.copy())
                 
-            except Exception as e:
-                logger.error(f"Error loading {filepath.name}: {e}")
-                continue
-        
-        # Sort by quality score (highest first)
-        speakers.sort(key=lambda x: x.quality_score, reverse=True)
-        
-        return speakers
-    
-    def _compute_similarities(self, audio_embedding: np.ndarray) -> Tuple[str, float]:
-        """
-        Compute similarities between input audio and all stored speaker embeddings
-        
-        Args:
-            audio_embedding: Input audio embedding
-            
-        Returns:
-            Tuple of (best_speaker_name, similarity_score)
-        """
-        similarities = []
-        
-        for speaker in self.speakers:
-            try:
-                # Compute cosine similarity
-                similarity = 1 - cosine(
-                    speaker.embedding.flatten(),
-                    audio_embedding.flatten()
-                )
+                if is_overlap:
+                    print(f"[DEBUG] Voice {idx+1}: {real_name} ({conf:.1%})")
+
+                verified_name = None
+                if real_name != "Unknown" and conf >= self.verifier_confidence_min:
+                    verified_name = real_name
+
+                disp = speaker_id
+                display_label = disp if not verified_name else f"{disp} ({verified_name})"
                 
-                # Clamp similarity to valid range
-                similarity = max(0.0, min(1.0, similarity))
-                similarities.append((speaker.name, similarity))
-                
-            except Exception as e:
-                logger.error(f"Error computing similarity for {speaker.name}: {e}")
-                similarities.append((speaker.name, 0.0))
-        
-        # Find the best match
-        if similarities:
-            best_match = max(similarities, key=lambda x: x[1])
-            return best_match if best_match[1] > self.threshold else (UNKNOWN_SPEAKER, best_match[1])
-        else:
-            return (UNKNOWN_SPEAKER, 0.0)
-    
-    def _process_audio_chunk(self, audio_chunk: np.ndarray, sample_rate: Optional[int] = None) -> Tuple[str, float]:
-        """
-        Process a chunk of audio and return speaker verification result
-        
-        Args:
-            audio_chunk: Audio data as numpy array
-            sample_rate: Sample rate of the audio (if different from target)
-            
-        Returns:
-            Tuple of (speaker_name, similarity_score)
-        """
-        try:
-            # Resample if necessary
-            if sample_rate and sample_rate != self.target_sample_rate:
-                audio_chunk = self.resample_audio(audio_chunk, sample_rate)
-            
-            # Convert to mono if stereo
-            if len(audio_chunk.shape) > 1:
-                audio_chunk = audio_chunk.mean(axis=1)
-            
-            # Convert to float32 and normalize
-            audio_chunk = audio_chunk.astype(np.float32)
-            audio_chunk = audio_chunk - np.mean(audio_chunk)
-            std = np.std(audio_chunk)
-            if std > 0:
-                audio_chunk = audio_chunk / std
-            
-            # Prepare for model input (batch, channel, samples)
-            waveform = torch.from_numpy(audio_chunk).unsqueeze(0).unsqueeze(0)
-            waveform = waveform.to(self.embedding_model.device)
-            
-            # Generate embedding
-            with torch.no_grad():
-                current_embedding = self.embedding_model(waveform)
-            
-            # Convert to numpy if it's a torch tensor
-            if hasattr(current_embedding, 'cpu'):
-                embedding_array = current_embedding.cpu().numpy()
-            else:
-                embedding_array = current_embedding
-            
-            # Compare with all speakers
-            return self._compute_similarities(embedding_array)
-            
-        except Exception as e:
-            logger.error(f"Error processing audio chunk: {e}")
-            return (UNKNOWN_SPEAKER, 0.0)
-    
-    def _audio_callback(self, indata: np.ndarray, frames: int, time: Any, status: Any) -> None:
-        """Callback for microphone input"""
-        if status:
-            logger.warning(f"Audio callback status: {status}")
-        
-        # Only queue audio if it's above minimum level
-        if np.abs(indata).mean() > MIN_AUDIO_LEVEL:
-            self.audio_queue.put(indata.copy())
-    
-    def _log_result(self, timestamp: str, speaker: str, similarity: float) -> None:
-        """Log verification results to file"""
-        try:
-            # Format the timestamp for better readability
-            current_time = datetime.datetime.now().strftime('%H:%M:%S')
-            
-            # Determine confidence level and status
-            if speaker == UNKNOWN_SPEAKER:
-                status = "❓ UNKNOWN"
-                confidence = "N/A"
-            else:
-                status = f"🎯 IDENTIFIED: {speaker}"
-                confidence = "HIGH" if similarity > 0.8 else "MEDIUM" if similarity > 0.6 else "LOW"
-            
-            # Create readable log entry
-            log_entry = f"[{current_time}] {status} | Similarity: {similarity:.3f} | Confidence: {confidence}\n"
-            
-            with open(self.results_file, 'a', encoding='utf-8') as f:
-                f.write(log_entry)
-                
-        except Exception as e:
-            logger.error(f"Error logging result: {e}")
-    
-    def process_audio_file(self, audio_file: str) -> List[Tuple[str, str, float]]:
-        """
-        Process a pre-recorded audio file for speaker verification
-        
-        Args:
-            audio_file: Path to WAV audio file
-            
-        Returns:
-            List of (timestamp, speaker_name, similarity_score) tuples
-            
-        Raises:
-            FileNotFoundError: If audio file doesn't exist
-            RuntimeError: If file processing fails
-        """
-        if not os.path.exists(audio_file):
-            raise FileNotFoundError(f"Audio file not found: {audio_file}")
-        
-        logger.info(f"Processing audio file: {audio_file}")
-        results = []
-        
-        try:
-            with wave.open(audio_file, 'rb') as wf:
-                # Get file properties
-                sample_rate = wf.getframerate()
-                channels = wf.getnchannels()
-                frames_total = wf.getnframes()
-                duration = frames_total / sample_rate
-                
-                logger.info(f"File properties: {sample_rate}Hz, {channels}ch, {duration:.1f}s")
-                
-                # Calculate chunk size in original sample rate
-                original_chunk_samples = int(self.chunk_duration * sample_rate)
-                chunk_count = 0
-                
-                while True:
-                    frames = wf.readframes(original_chunk_samples)
-                    if not frames:
-                        break
+                try:
+                    source_normalized = self.normalize_audio(source_np)
                     
-                    chunk_count += 1
-                    
-                    # Convert bytes to numpy array
-                    if wf.getsampwidth() == 2:  # 16-bit
-                        audio_chunk = np.frombuffer(frames, dtype=np.int16)
-                        audio_chunk = audio_chunk.astype(np.float32) / 32767.0
-                    elif wf.getsampwidth() == 4:  # 32-bit
-                        audio_chunk = np.frombuffer(frames, dtype=np.int32)
-                        audio_chunk = audio_chunk.astype(np.float32) / 2147483647.0
+                    if isinstance(source_normalized, np.ndarray):
+                        audio_for_whisper = source_normalized
                     else:
-                        logger.warning(f"Unsupported sample width: {wf.getsampwidth()}")
+                        audio_for_whisper = source_normalized.cpu().numpy()
+                    
+                    logger.debug(f"Audio shape: {audio_for_whisper.shape}, dtype: {audio_for_whisper.dtype}")
+                    
+                    start_whisper = time.time()
+                    segs, _ = self.whisper.transcribe(
+                        audio_for_whisper, 
+                        language="pt", 
+                        beam_size=1,
+                        vad_filter=False,
+                        without_timestamps=True
+                    )
+                    text = " ".join([s.text for s in segs]).strip()
+                    elapsed_whisper = time.time() - start_whisper
+                    
+                    logger.debug(f"Whisper: {elapsed_whisper:.2f}s, result: '{text[:50]}...'")
+                    
+                    if not text:
+                        logger.debug(f"[{turn.start:.1f}s] {speaker_id}: Whisper returned empty, skipping...")
                         continue
                     
-                    # Convert to mono if stereo
-                    if channels > 1:
-                        audio_chunk = audio_chunk.reshape(-1, channels).mean(axis=1)
-                    
-                    # Skip processing if audio chunk is too quiet
-                    if np.abs(audio_chunk).mean() < MIN_AUDIO_LEVEL:
+                    if "Amara.org" in text:
+                        logger.debug(f"[{turn.start:.1f}s] {speaker_id}: Watermark detected, skipping...")
                         continue
                     
-                    # Process chunk
-                    speaker, similarity = self._process_audio_chunk(audio_chunk, sample_rate)
-                    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                    clean_new = self.normalize_text(text)
+                    last_entry = speaker_history.get(disp)
                     
-                    # Log and store result
-                    self._log_result(timestamp, speaker, similarity)
-                    results.append((timestamp, speaker, similarity))
+                    is_duplicate = False
+                    if last_entry and clean_new:
+                        time_diff = turn.start - last_entry['time']
+                        if time_diff < 1.0: 
+                            clean_old = last_entry['clean_text']
+                            ratio = SequenceMatcher(None, clean_new, clean_old).ratio()
+                            if ratio > 0.8: 
+                                is_duplicate = True
                     
-                    # Print progress
-                    status = "✓" if speaker != UNKNOWN_SPEAKER else "?"
-                    logger.info(f"[{timestamp}] {status} Chunk {chunk_count}: {speaker} (similarity: {similarity:.3f})")
-                
-                logger.info(f"Processed {chunk_count} chunks from {audio_file}")
-                return results
-                
-        except Exception as e:
-            logger.error(f"Error processing audio file: {e}")
-            raise RuntimeError(f"Failed to process audio file: {e}")
-    
-    def start_microphone_verification(self, device_sample_rate: Optional[int] = None) -> None:
-        """
-        Start real-time verification from microphone input
-        
-        Args:
-            device_sample_rate: Optional sample rate for the input device
-        """
-        if self.is_running:
-            logger.warning("Verification already running")
-            return
-        
-        logger.info("Starting microphone verification")
-        self.is_running = True
-        
-        # Use device sample rate if provided, otherwise use target rate
-        input_sample_rate = device_sample_rate or self.target_sample_rate
-        input_chunk_samples = int(self.chunk_duration * input_sample_rate)
-        
-        def processing_thread():
-            """Audio processing thread"""
-            try:
-                with sd.InputStream(
-                    channels=1,
-                    samplerate=input_sample_rate,
-                    blocksize=input_chunk_samples,
-                    callback=self._audio_callback
-                ):
-                    logger.info("Started real-time verification")
-                    logger.info(f"Input sample rate: {input_sample_rate} Hz")
-                    logger.info(f"Target sample rate: {self.target_sample_rate} Hz")
-                    logger.info(f"Chunk duration: {self.chunk_duration}s")
-                    logger.info(f"Threshold: {self.threshold}")
-                    logger.info(f"Loaded speakers: {[s.name for s in self.speakers]}")
-                    logger.info(f"Results logging to: {self.results_file}")
-                    logger.info("Listening... (Call stop_verification() to stop)")
+                    if is_duplicate:
+                        logger.debug(f"[{turn.start:.1f}s] {disp}: Duplicate (similar>{ratio:.0%}), skipping...")
+                        continue
                     
-                    while self.is_running:
-                        try:
-                            audio_chunk = self.audio_queue.get(timeout=1.0)
-                            
-                            # Process chunk with input sample rate for resampling
-                            speaker, similarity = self._process_audio_chunk(
-                                audio_chunk, input_sample_rate)
-                            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-                            
-                            # Log and print result
-                            self._log_result(timestamp, speaker, similarity)
-                            
-                            status = "✓" if speaker != UNKNOWN_SPEAKER else "?"
-                            logger.info(f"[{timestamp}] {status} Detected: {speaker} (similarity: {similarity:.3f})")
-                            
-                        except queue.Empty:
-                            continue
-                        except Exception as e:
-                            logger.error(f"Error processing audio chunk: {e}")
-                            continue
-                            
-            except Exception as e:
-                logger.error(f"Error in audio stream: {e}")
-                self.is_running = False
-            finally:
-                logger.info("Audio processing thread stopped")
-        
-        # Start processing thread
-        self.processing_thread = threading.Thread(target=processing_thread, daemon=True)
-        self.processing_thread.start()
-    
-    def _write_session_summary(self) -> None:
-        """Write session summary to results file"""
-        try:
-            with open(self.results_file, 'a', encoding='utf-8') as f:
-                f.write(f"\n" + "=" * 50 + "\n")
-                f.write(f"Session ended: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Total duration: {(datetime.datetime.now() - self.session_start_time).total_seconds():.1f} seconds\n")
-                f.write(f"Speakers available: {', '.join(self.speaker_profiles.keys())}\n")
-                f.write("=" * 50 + "\n")
-        except Exception as e:
-            logger.error(f"Error writing session summary: {e}")
+                    transcribed_segments += 1
+                    speaker_history[disp] = {'clean_text': clean_new, 'time': turn.start}
 
-    def stop_verification(self) -> None:
-        """Stop the verification process"""
-        if not self.is_running:
-            logger.warning("Verification not running")
-            return
+                    suffix = f" (Voice {idx+1})" if is_overlap else ""
+                    logger.debug(f"[{turn.start:.1f}s] {display_label}{suffix}: TRANSCRIBED")
+                    print(f" [{turn.start:.1f}s] {display_label}{suffix}: {text}")
+                    
+                    full_transcript.append({
+                        "speaker": disp,
+                        "verified_name": verified_name,
+                        "text": text,
+                        "start": turn.start,
+                        "suffix": suffix
+                    })
+                except Exception as e:
+                    logger.error(f"Whisper error: {e}")
         
-        logger.info("Stopping verification")
-        self.is_running = False
+        elapsed_transcription = time.time() - start_transcription
+        logger.info(f"\nTotal transcription: {elapsed_transcription:.2f}s")
         
-        # Wait for processing thread to finish
-        if self.processing_thread and self.processing_thread.is_alive():
-            self.processing_thread.join(timeout=2.0)
+        coverage_rate = (transcribed_segments / total_segments * 100) if total_segments > 0 else 0
+        unique_speakers = len(set(line['speaker'] for line in full_transcript))
+        logger.info(f"\nTRANSCRIPTION STATISTICS:")
+        logger.info(f"Segments processed: {total_segments}")
+        logger.info(f"Segments transcribed: {transcribed_segments}")
+        logger.info(f"Coverage rate: {coverage_rate:.1f}%")
+        logger.info(f"Unique speakers: {unique_speakers}")
         
-        # Write session summary
-        self._write_session_summary()
-        
-        logger.info(f"Verification stopped. Results saved to: {self.results_file}")
-    
-    def get_speaker_profiles(self) -> List[SpeakerProfile]:
-        """Get list of loaded speaker profiles"""
-        return self.speakers.copy()
-    
-    def get_status(self) -> Dict[str, Any]:
-        """Get current verification status"""
-        return {
-            'running': self.is_running,
-            'num_speakers': len(self.speakers),
-            'speaker_names': [s.name for s in self.speakers],
-            'threshold': self.threshold,
-            'target_sample_rate': self.target_sample_rate,
-            'chunk_duration': self.chunk_duration,
-            'results_file': self.results_file,
-            'queue_size': self.audio_queue.qsize() if hasattr(self, 'audio_queue') else 0
-        }
-
-
-def main() -> None:
-    """Main function for interactive multi-speaker verification"""
-    print("\n👥 Multi-Speaker Verification System")
-    print("=" * 50)
-    print("DevAgent PyAnnote Speaker Recognition")
-    print()
-    
-    try:
-        # Check for embeddings directory
-        embeddings_dir = "data/embeddings"
-        if not os.path.exists(embeddings_dir):
-            print("❌ No 'data/embeddings' directory found.")
-            print("   Please create speaker profiles first using:")
-            print("   python src/audio_profile_creator.py")
-            return
-        
-        # Initialize verifier
-        print("🔧 Initializing multi-speaker verifier...")
-        verifier = MultiSpeakerVerifier(embeddings_dir)
-        
-        # Display status
-        status = verifier.get_status()
-        print(f"\n📊 System Status:")
-        print(f"   Speakers loaded: {status['num_speakers']}")
-        print(f"   Speaker names: {', '.join(status['speaker_names'])}")
-        print(f"   Threshold: {status['threshold']}")
-        print(f"   Sample rate: {status['target_sample_rate']} Hz")
-        
-        # Main menu loop
-        while True:
-            print(f"\n🎯 Select verification mode:")
-            print("   1. Real-time microphone input")
-            print("   2. Process audio file")
-            print("   3. Show speaker profiles")
-            print("   4. Exit")
+        if unknown_speakers_audio:
+            start_names = time.time()
+            logger.info(f"\nDetected {len(unknown_speakers_audio)} unknown speaker(s)")
+            logger.info("Analyzing transcript to identify names...")
             
-            choice = input("\nEnter choice (1-4): ").strip()
+            speaker_names = self.associate_names_with_speakers(full_transcript)
             
-            if choice == "1":
-                # Real-time microphone verification
-                try:
-                    device_rate_input = input("Enter microphone sample rate (or press Enter for default): ").strip()
-                    device_rate = int(device_rate_input) if device_rate_input else None
-                except ValueError:
-                    device_rate = None
-                    print("Using default sample rate")
+            if speaker_names:
+                elapsed_names = time.time() - start_names
+                logger.info(f"\nNames identified: {speaker_names}")
+                logger.info(f"Name detection: {elapsed_names:.2f}s")
                 
-                try:
-                    print(f"\n🎤 Starting microphone verification...")
-                    verifier.start_microphone_verification(device_rate)
-                    input("\nPress Enter to stop verification...\n")
-                finally:
-                    verifier.stop_verification()
-                    
-            elif choice == "2":
-                # Audio file processing
-                audio_file = input("\nEnter path to WAV file: ").strip()
-                if os.path.exists(audio_file):
-                    try:
-                        print(f"\n🎵 Processing audio file...")
-                        results = verifier.process_audio_file(audio_file)
-                        
-                        if results:
-                            print(f"\n📊 Processing Summary:")
-                            speakers_detected = {}
-                            for _, speaker, similarity in results:
-                                if speaker not in speakers_detected:
-                                    speakers_detected[speaker] = []
-                                speakers_detected[speaker].append(similarity)
-                            
-                            for speaker, similarities in speakers_detected.items():
-                                avg_sim = np.mean(similarities)
-                                count = len(similarities)
-                                print(f"   {speaker}: {count} chunks, avg similarity: {avg_sim:.3f}")
-                        
-                    except Exception as e:
-                        print(f"❌ Error processing file: {e}")
-                else:
-                    print("❌ File not found!")
-                    
-            elif choice == "3":
-                # Show speaker profiles
-                profiles = verifier.get_speaker_profiles()
-                print(f"\n👥 Loaded Speaker Profiles ({len(profiles)}):")
-                print("-" * 60)
-                for i, profile in enumerate(profiles, 1):
-                    print(f"   {i}. {profile.name}")
-                    print(f"      Quality: {profile.quality_score:.3f}")
-                    print(f"      File: {profile.filename}")
-                    print(f"      Embedding shape: {profile.embedding.shape}")
-                    if profile.metadata:
-                        created = profile.metadata.get('created_at', 'Unknown')
-                        print(f"      Created: {created}")
-                    print()
-                    
-            elif choice == "4":
-                print("\n👋 Goodbye!")
-                break
+                embeddings_dir = embeddings_dir or "../data/embeddings"
+                if not os.path.exists(embeddings_dir):
+                    os.makedirs(embeddings_dir)
                 
+                start_embeddings = time.time()
+                self.save_new_embeddings(unknown_speakers_audio, speaker_names, embeddings_dir)
+                elapsed_embeddings = time.time() - start_embeddings
+                logger.info(f"Embedding creation: {elapsed_embeddings:.2f}s")
             else:
-                print("❌ Invalid choice! Please select 1-4.")
-                
-    except KeyboardInterrupt:
-        print("\n\n👋 Operation cancelled by user")
-    except Exception as e:
-        logger.error(f"Error in main: {e}")
-        print(f"❌ Error: {e}")
-
+                logger.info("No name was identified in the conversation")
+        
+        elapsed_total = time.time() - start_total
+        logger.info(f"\n{'='*60}")
+        logger.info(f"TOTAL TIME: {elapsed_total:.2f}s")
+        logger.info(f"{'='*60}")
+        
+        return full_transcript
 
 if __name__ == "__main__":
-    main()
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    candidate_dirs = [
+        os.path.join(base_dir, "data", "embeddings"),
+        os.path.join(base_dir, "data", "embeddings", "individual"),
+    ]
+    embeddings_dir = next((d for d in candidate_dirs if os.path.exists(d)), None)
+    if not embeddings_dir:
+        print("Embeddings directory not found")
+        exit()
+
+    print("Initializing...")
+    try:
+        verifier = MultiSpeakerVerifier(embeddings_dir, threshold=0.65)
+        system = LargeMeetingTranscriber(
+            verifier,
+            HF_TOKEN,
+            diarization_clustering_threshold=0.45,
+            verifier_confidence_min=0.9,
+            min_segment_duration=0.6,
+        )
+
+        while True:
+            f = input("\nFile: ").strip()
+            if f in ['sair', 'exit']:
+                break
+            path = f if os.path.exists(f) else f"../data/testes/{f}"
+            
+            if os.path.exists(path):
+                num_speakers_input = input("MAXIMUM number of speakers (Enter for automatic detection): ").strip()
+                num_speakers = None
+                if num_speakers_input.isdigit():
+                    num_speakers = int(num_speakers_input)
+                    print(f"Limiting to maximum {num_speakers} speaker(s)")
+                else:
+                    print("Automatic speaker detection")
+                
+                transcript_result = system.process_audio(path, embeddings_dir, num_speakers=num_speakers)
+                
+                base_name = os.path.splitext(os.path.basename(path))[0]
+                output_filename = f"{base_name}_transcript.txt"
+                
+                if transcript_result:
+                    print(f"\nSaving transcript to: {output_filename} ...")
+                    with open(output_filename, "w", encoding="utf-8") as txt_file:
+                        txt_file.write(f"FILE: {f}\n")
+                        txt_file.write("-" * 50 + "\n\n")
+                        
+                        for line in transcript_result:
+                            timestamp = f"[{line['start']:.1f}s]"
+                            speaker = line['speaker']
+                            verified_name = line.get('verified_name')
+                            suffix = line.get('suffix', '')
+                            text = line['text']
+                            if verified_name:
+                                txt_file.write(f"{timestamp} {speaker} ({verified_name}){suffix}: {text}\n")
+                            else:
+                                txt_file.write(f"{timestamp} {speaker}{suffix}: {text}\n")
+                    
+                    print(f"File '{output_filename}' saved successfully!")
+                else:
+                    print("No speech detected.")
+            else:
+                print("File does not exist.")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")

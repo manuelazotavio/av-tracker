@@ -1,0 +1,178 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%% Modelo desenvolvido por Alunos do IFSP - PEP para o CONICT 2020.
+% Atualizado para o CONICT 2026 - Guarulhos.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[a4paper,11pt]{article}
+
+\input{preambulo}
+
+\fancypagestyle{empty}{%
+\fancyhf{}
+\fancyfoot[L]{17º CONICT 2026}
+\fancyfoot[C]{\thepage}
+\fancyfoot[R]{ISSN: 2178-9959}
+\renewcommand{\headrulewidth}{0pt}%
+\renewcommand{\footrulewidth}{0pt}%
+}
+
+\usepackage{float}
+\usepackage{url}
+
+\pagestyle{empty}
+
+\begin{document}
+
+\input{cabecalho}
+
+%----------------------------------------TEXTOS-------------------------------------------------%
+
+\vspace{0.5cm}
+\noindent\textbf{RESUMO}: Este trabalho tem o objetivo de apresentar e avaliar um sistema multimodal desenvolvido para identificar quem está falando em reuniões presenciais e híbridas. A identificação de locutores é uma etapa importante para a produção de transcrições organizadas, atas automáticas e sistemas inteligentes de comunicação. Para realizar essa tarefa, o sistema integra biometria de voz, diarização, reconhecimento facial, rastreamento de pessoas e análise de movimento labial em uma cascata de decisão executada em tempo real. O sistema foi avaliado em uma base interna de desenvolvimento com 92 sessões e 1.660 segmentos aceitos como fala. Os resultados mostram que as modalidades atuam de forma complementar: a voz participou diretamente de 8,6\% das decisões, enquanto a detecção de locutor ativo, a face e o rastreamento de sessão ampliaram a cobertura para os demais segmentos. O fator de tempo real permaneceu abaixo de 1 em 89,6\% dos casos. Entre as atribuições nomeadas, o sinalizador de risco também distinguiu casos não sinalizados (81,8\%) de casos sinalizados (24,8\%; $p<0{,}001$), indicando sua utilidade para direcionar a revisão humana. Dessa forma, a arquitetura proposta estabelece uma solução funcional, auditável e reprodutível para aplicações de reunião inteligente.
+
+\vspace{0.5cm}
+\noindent\textbf{PALAVRAS-CHAVE}: atribuição de locutor; biometria de voz; fusão multimodal; rastreamento facial; reuniões inteligentes.
+
+\vspace{0.5cm}
+\begin{center}
+\textbf{ANALYSIS OF A REAL-TIME MULTIMODAL CASCADE FOR SPEAKER ATTRIBUTION IN MEETINGS}
+\end{center}
+
+\noindent\textbf{ABSTRACT}: This work presents and evaluates a multimodal system developed to identify who is speaking in in-person and hybrid meetings. Speaker identification is an important step toward structured transcripts, automatic minutes, and intelligent communication systems. The proposed system integrates voice biometrics, diarization, face recognition, person tracking, and lip-motion analysis in a real-time decision cascade. The system was evaluated on an internal development dataset with 92 sessions and 1{,}660 segments accepted as speech. The results show that the modalities operate in a complementary manner: voice evidence participated directly in 8.6\% of the decisions, while active speaker detection, face information, and session tracking extended coverage to the remaining segments. The real-time factor remained below 1 in 89.6\% of the cases. Among named assignments, the risk flag also distinguished unflagged cases (81.8\%) from flagged cases (24.8\%; $p<0.001$), indicating its usefulness for directing human review. Therefore, the proposed architecture establishes a functional, auditable, and reproducible solution for intelligent meeting applications.
+
+\vspace{0.5cm}
+\noindent\textbf{KEYWORDS}: speaker attribution; voice biometrics; multimodal fusion; face tracking; intelligent meetings.
+
+\section*{Introdução}
+
+A identificação de quem está falando em uma reunião é um desafio essencial para aprimorar a interação humano-computador e viabilizar transcrições estruturadas, atas automáticas e recuperação de informações por participante. A diarização organiza o áudio e responde ``quem falou quando'', porém seus agrupamentos são anônimos e podem mudar entre janelas de processamento \cite{bredin2023}. A biometria de voz permite comparar os segmentos com perfis cadastrados por meio de representações como as produzidas pelo ECAPA-TDNN \cite{desplanques2020}. Em reuniões reais, no entanto, ruído, falas curtas, sobreposição e mudanças de enquadramento tornam importante o uso de evidências complementares.
+
+Nesse contexto, a detecção de locutor ativo (ASD, do inglês \textit{active speaker detection}) relaciona a fala ao movimento facial observado no vídeo. Bases como AVA-ActiveSpeaker demonstram a importância da integração audiovisual \cite{roth2020}, enquanto TalkNet e Light-ASD exploram informações temporais do áudio e da região da boca \cite{tao2021,liao2023}. Este trabalho tem o objetivo de investigar um sistema multimodal de atribuição de locutores, analisando a contribuição de cada modalidade, o comportamento com diferentes quantidades de participantes, o processamento em tempo real e o sinalizador de risco.
+
+\section*{Materiais e Métodos}
+
+O sistema foi desenvolvido em Python e organizado em dois fluxos cooperativos, um para áudio e outro para vídeo. No início de cada sessão são definidos o dispositivo de captura, o número esperado de participantes e os perfis biométricos disponíveis. Os dois fluxos compartilham o estado da sessão, de modo que as evidências vocais, faciais e temporais possam ser associadas ao mesmo segmento de fala. A unidade de análise é o segmento aceito pelo fluxo de áudio; para cada unidade, o sistema produz a identidade atribuída, a regra responsável pela decisão, as pontuações intermediárias, o sinalizador de risco e as latências de processamento.
+
+No fluxo de áudio, o sinal é convertido para 16~kHz e processado em janelas de 15~s, com avanço de 5~s. O pyannote.audio 3.1 realiza a diarização e organiza as regiões de fala em turnos de pelo menos 0,5~s, utilizando limiar de agrupamento de 0,60 e limiar de segmentação de 0,40. O número esperado de participantes é informado ao diarizador para manter coerência com a configuração da sessão. Quando é detectada sobreposição, o SepFormer pode separar as fontes antes das etapas seguintes \cite{subakan2021}. Cada turno é transcrito pelo \texttt{faster-whisper}, com o modelo Whisper de tamanho médio \cite{radford2023}. São aplicados filtros de atividade de voz, probabilidade de ausência de fala, confiança da transcrição e plausibilidade textual, de forma que somente regiões consistentes sejam encaminhadas à atribuição de identidade.
+
+Para a biometria de voz, cada segmento aceito é convertido em uma representação ECAPA-TDNN e comparado com os perfis cadastrados. O sistema preserva a melhor pontuação, a margem para os demais candidatos e a quantidade de perfis avaliados. Os parâmetros nominais foram 0,80 para o verificador e 0,70 para o nível mínimo de confiança registrado na cascata. Esses valores, assim como o modelo de transcrição, a taxa de amostragem e a quantidade esperada de participantes, são armazenados na configuração de cada sessão. Assim, cada resultado pode ser relacionado aos parâmetros efetivamente utilizados em sua produção.
+
+No fluxo de vídeo, o YOLOv8 detecta as faces com confiança mínima de 0,30 \cite{jocher2023}. O ByteTrack mantém as trajetórias entre quadros \cite{zhang2022}, enquanto o EdgeFace extrai as representações faciais e as compara com os cadastros disponíveis \cite{george2024}. O limiar de associação facial foi 0,65 e o limiar de fusão de trajetórias, 0,55. A persistência das trajetórias permite aproveitar uma identificação obtida em quadros anteriores quando o participante continua visível. Para estimar quem está falando, o Light-ASD relaciona o trecho de áudio com a sequência facial correspondente. Quando sua pontuação não está disponível, uma medida complementar calcula a variação temporal da região da boca. A associação temporal utiliza o intervalo do segmento de fala para selecionar as observações visuais correspondentes.
+
+\begin{table}[H]
+    \centering
+    \caption{Configuração principal empregada no experimento.}
+    \label{tab:parametros}
+    \footnotesize
+    \begin{tabular}{ll}
+        \hline
+        \textbf{Etapa} & \textbf{Configuração} \\
+        \hline
+        Áudio & 16~kHz; janelas de 15~s; avanço de 5~s \\
+        Diarização & turno mínimo de 0,5~s; limiares 0,60 e 0,40 \\
+        Transcrição & \texttt{faster-whisper}; modelo médio \\
+        Verificação vocal & ECAPA-TDNN; parâmetros 0,80 e 0,70 \\
+        Detecção facial & YOLOv8; confiança mínima de 0,30 \\
+        Associação facial & EdgeFace; limiares 0,65 e 0,55 \\
+        Locutor ativo & Light-ASD e variação temporal da boca \\
+        \hline
+    \end{tabular}
+\end{table}
+
+A fusão é executada como uma cascata determinística. A ordem de avaliação é: (i) voz de alta confiança; (ii) voz moderada; (iii) voz de baixa confiança com corroboração visual ou acústica; (iv) detecção de locutor ativo; (v) identidade facial e coerência acústico-visual; e (vi) associações persistentes da diarização ou da voz na sessão. A primeira condição atendida determina a atribuição final. Essa organização permite utilizar diretamente uma evidência forte e combinar modalidades quando a decisão recebe apoio adicional. O sinalizador de risco é calculado durante a execução a partir da confiança, da margem entre candidatos e da disponibilidade de corroboração, permanecendo associado ao segmento para orientar a validação posterior.
+
+Todas as etapas registram seus resultados em SQLite. Para cada segmento são armazenados o índice na sessão, a regra da decisão, a identidade final em relação aos perfis cadastrados, a confiança bruta, o número de faces, a presença de locutor ativo, os indicadores de identificação e risco, a duração da fala e os tempos de transcrição, verificação vocal e processamento total. Esse registro por segmento evita depender apenas de médias globais e permite reconstruir as tabelas a partir das decisões individuais. A FIGURA~\ref{fig:experimento} resume o caminho entre a aquisição multimodal e a análise estatística.
+
+\begin{figure}[H]
+    \vspace{-0.2cm}
+    \centering
+    \footnotesize
+    Áudio/vídeo $\rightarrow$ processamento multimodal $\rightarrow$ cascata de decisão $\rightarrow$ SQLite $\rightarrow$ análise estatística
+    \caption{Fluxo do experimento e da produção das métricas.}
+    \label{fig:experimento}
+    \vspace{-0.25cm}
+\end{figure}
+
+A base interna de desenvolvimento contém 106 sessões realizadas entre 16 de março e 22 de maio de 2026. O critério de inclusão foi a existência de pelo menos um segmento aceito como fala; por esse procedimento, 14 sessões vazias foram retiradas e 92 sessões integraram a análise, totalizando 1.660 segmentos. A distribuição foi de 19 sessões com um participante, 7 com dois, 4 com três e 62 com quatro. As sessões não foram roteirizadas e ocorreram com variações de iluminação, enquadramento e disponibilidade de cadastro, permitindo observar a atuação da cascata em diferentes configurações de captura. A duração média dos segmentos foi 3,39~s, com mediana de 2,94~s e máximo de 15,00~s. Informações sociodemográficas não integraram o protocolo de coleta; por isso, a caracterização da base se concentra nas condições técnicas e na quantidade de participantes.
+
+As variáveis independentes foram o número esperado de participantes e a regra que originou a decisão. As variáveis dependentes foram a proporção de segmentos atribuídos por cada grupo de evidência, as latências de processamento, o fator de tempo real e, no subconjunto revisado, a correspondência da identidade. Para um segmento $i$, com tempo total $t_i$ em milissegundos e duração $d_i$ em segundos, o fator de tempo real foi calculado por
+\begin{equation}
+    \mathrm{RTF}_i = \frac{t_i}{1000d_i}.
+\end{equation}
+Valores inferiores a 1 indicam que o processamento terminou em tempo menor que a duração do próprio segmento. Foram calculadas média, mediana e máximo das durações e latências, além da proporção de segmentos com $\mathrm{RTF}<1$.
+
+O subconjunto com revisão humana contém 330 segmentos de 24 sessões. Quando uma sessão possuía mais de uma revisão, foi selecionada a validação mais recente, evitando a contagem duplicada do mesmo segmento. A correspondência exata foi definida pela igualdade entre a atribuição prevista e a correção humana após normalização de espaços e comparação sem distinção entre letras maiúsculas e minúsculas. As previsões nomeadas excluem rótulos genéricos de diarização, como \texttt{SPEAKER\_00}, permitindo avaliar separadamente as decisões associadas a um perfil cadastrado. Os grupos sinalizado e não sinalizado foram formados antes da comparação com as correções humanas.
+
+As proporções receberam intervalos de confiança de 95\% pelo método de Wilson \cite{wilson1927}. Para a análise do sinalizador de risco, foi formada uma tabela $2\times2$ entre grupo de risco e correspondência da identidade nas atribuições nomeadas. A diferença entre os grupos foi avaliada pelo teste exato de Fisher bilateral, com nível de significância $\alpha=0{,}05$. Os experimentos foram executados em um Intel Core i5-11400H, com 8~GB de memória e GPU NVIDIA RTX 3060 Laptop de 6~GB.
+
+Para permitir a reprodução da avaliação, o artefato anônimo (\url{https://github.com/anonimo826/anonimo}) reúne o snapshot do código, o esquema de decisão, os parâmetros por sessão, o dicionário dos dados e o protocolo da FIGURA~\ref{fig:experimento}. Três arquivos derivados reúnem 92 sessões, 1.660 segmentos e 330 validações. Com um único comando, um script baseado na biblioteca padrão do Python verifica as contagens e recria as tabelas, os intervalos de Wilson e o teste de Fisher. Áudio, vídeo, nomes, transcrições, datas absolutas e representações biométricas não são distribuídos; as sessões usam códigos sequenciais e as comparações de identidade, indicadores binários. Arquivos de configuração, relatório de privacidade e hashes SHA-256 completam a documentação e a verificação da análise quantitativa.
+
+\section*{Resultados e Discussão}
+
+Os resultados mostram que o sistema multimodal utiliza as modalidades de forma complementar. A TABELA~\ref{tab:decisoes} apresenta a fonte da decisão final nos 1.660 segmentos. A voz de alta ou moderada confiança realizou 67 atribuições sem a necessidade de outra evidência. Em outros 76 casos, a voz de baixa confiança contribuiu com o apoio de informações complementares. A detecção de locutor ativo participou de 580 decisões, enquanto a face e a coerência de gênero vocal contribuíram em 435 casos. As associações de diarização e o rastreamento de sessão responderam por 502 segmentos.
+
+\begin{table}[H]
+    \centering
+    \caption{Fonte da decisão final nos 1.660 segmentos de 92 sessões.}
+    \label{tab:decisoes}
+    \footnotesize
+    \begin{tabular}{lrr}
+        \hline
+        \textbf{Fonte de evidência} & \textbf{Segmentos} & \textbf{\%} \\
+        \hline
+        Voz de alta confiança, sem corroboração & 51  & 3,1 \\
+        Voz moderada, sem corroboração          & 16  & 1,0 \\
+        Voz fraca, com corroboração             & 76  & 4,6 \\
+        ASD                                     & 580 & 34,9 \\
+        Face e coerência de gênero vocal        & 435 & 26,2 \\
+        Diarização/rastreamento de sessão       & 502 & 30,2 \\
+        \hline
+        Total                                   & 1.660 & 100,0 \\
+        \hline
+    \end{tabular}
+\end{table}
+
+A distribuição evidencia a importância da integração multimodal. A voz participa das decisões sempre que as condições de confiança são atendidas, enquanto o ASD, a face e o rastreamento permitem continuar a identificação nos segmentos em que outras informações estão disponíveis. Dessa maneira, a cascata amplia a cobertura e mantém o registro da evidência que originou cada resultado.
+
+A TABELA~\ref{tab:grupos} apresenta a cobertura de acordo com o número esperado de participantes. As sessões com quatro participantes concentram 82,4\% dos segmentos e utilizam evidência visual ou de sessão em 95,0\% das decisões. Esse resultado mostra que o sistema aproveita com maior frequência as modalidades complementares nos cenários com mais participantes.
+
+\begin{table}[H]
+    \centering
+    \caption{Cobertura por número esperado de participantes.}
+    \label{tab:grupos}
+    \footnotesize
+    \begin{tabular}{rrrrrr}
+        \hline
+        \textbf{Part.} & \textbf{Sess.} & \textbf{Seg.} & \textbf{Voz só} & \textbf{Voz+corr.} & \textbf{Visual/sessão} \\
+        \hline
+        1 & 19 & 71    & 2,8\%  & 8,5\%  & 88,7\% \\
+        2 & 7  & 118   & 14,4\% & 25,4\% & 60,2\% \\
+        3 & 4  & 103   & 5,8\%  & 13,6\% & 80,6\% \\
+        4 & 62 & 1.368 & 3,1\%  & 1,9\%  & 95,0\% \\
+        \hline
+    \end{tabular}
+\end{table}
+
+O sistema também apresentou capacidade de processamento em tempo real. O tempo total médio foi 1.532,6~ms por segmento, com mediana de 633,1~ms. O fator de tempo real teve mediana de 0,24 e permaneceu abaixo de 1 em 1.488 dos 1.660 segmentos, correspondendo a 89,6\% dos casos. A transcrição apresentou mediana de 513,6~ms, enquanto a verificação de voz apresentou mediana de 29,7~ms. Esses valores indicam que o sistema consegue acompanhar a reunião durante a execução na maior parte dos segmentos analisados.
+
+O sinalizador de risco apresentou um resultado relevante para a organização da revisão humana. Entre as atribuições nomeadas, 9 de 11 casos não sinalizados estavam corretos, correspondendo a 81,8\%. Entre os 113 casos sinalizados, 28 estavam corretos, correspondendo a 24,8\%. A diferença foi significativa ($p<0{,}001$), indicando que o sinalizador consegue separar grupos com comportamentos distintos e pode ser utilizado para priorizar os segmentos que exigem conferência.
+
+O Light-ASD alcança 94,06\% de mAP no AVA-ActiveSpeaker e F1 médio de 81,1\% no conjunto Columbia \cite{liao2023,chakravarty2016}, reforçando o potencial desse componente. No sistema proposto, ele coopera com o movimento da boca, o reconhecimento facial e as informações de áudio.
+
+\section*{Conclusões}
+
+Este trabalho apresentou um sistema multimodal que integra biometria de voz, diarização, transcrição, reconhecimento facial, rastreamento de pessoas e detecção de locutor ativo para atribuir segmentos de fala aos participantes de reuniões. Os resultados mostram que a integração amplia a cobertura e permite selecionar diferentes fontes de evidência de acordo com cada segmento. O sistema processou 89,6\% dos casos em tempo inferior à duração da fala, registrou a origem das decisões e utilizou o sinalizador de risco para apoiar a revisão humana.
+
+Dessa forma, a arquitetura proposta estabelece uma base funcional e reprodutível para tecnologias de reunião inteligente. A continuidade do estudo permitirá aperfeiçoar os limiares e realizar validação em bases públicas multiculturais, ampliando a análise de generalização para diferentes contextos de uso.
+
+% A submissão para avaliação deve permanecer anônima. Não incluir aqui
+% contribuições nominais nem agradecimentos institucionais.
+% Na versão final, restaurar a lista completa de autores, incluindo
+% Elizabete e Shan (nomes completos e contribuições a confirmar), e usar
+% a denominação institucional "GN Advanced Science" nos agradecimentos.
+
+\bibliography{bibliografia}
+
+\end{document}

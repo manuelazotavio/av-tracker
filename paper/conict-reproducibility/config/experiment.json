@@ -1,0 +1,53 @@
+{
+  "artifact_version": "1.0.0",
+  "analysis_python": ">=3.10 (standard library only)",
+  "source_snapshot": {
+    "repository_commit": "60ebec7bfc9995617f6bd526f4c686f9dab71d5d",
+    "note": "O artefato registra também as alterações do diretório de trabalho usadas na análise."
+  },
+  "dataset": {
+    "source": "internal development dataset",
+    "sessions_total": 106,
+    "sessions_excluded_without_speech": 14,
+    "sessions_analyzed": 92,
+    "segments_analyzed": 1660,
+    "validated_sessions": 24,
+    "validated_segments": 330
+  },
+  "audio_pipeline": {
+    "sample_rate_hz": 16000,
+    "diarization_window_s": 15,
+    "diarization_step_s": 5,
+    "minimum_turn_s": 0.5,
+    "clustering_threshold": 0.6,
+    "segmentation_threshold": 0.4,
+    "voice_verifier_threshold": 0.8,
+    "voice_high_confidence_threshold": 0.7,
+    "diarization_model": "pyannote/speaker-diarization-3.1",
+    "separation_model": "speechbrain/sepformer-whamr",
+    "transcription_implementation": "faster-whisper",
+    "transcription_model_size": "medium",
+    "speaker_embedding_model": "speechbrain/spkrec-ecapa-voxceleb"
+  },
+  "video_pipeline": {
+    "face_detector": "yolov8n-face.pt",
+    "face_detection_confidence": 0.3,
+    "tracker": "ByteTrack",
+    "face_embedding_model": "edgeface_xxs.pt",
+    "face_match_threshold": 0.65,
+    "face_merge_threshold": 0.55,
+    "active_speaker_model": "Light-ASD pretrained AVA checkpoint",
+    "active_speaker_fallback": "mouth-region temporal variation"
+  },
+  "hardware": {
+    "cpu": "Intel Core i5-11400H",
+    "ram_gb": 8,
+    "gpu": "NVIDIA RTX 3060 Laptop",
+    "gpu_memory_gb": 6
+  },
+  "statistics": {
+    "confidence_interval": "Wilson 95%",
+    "group_comparison": "two-sided Fisher exact test",
+    "alpha": 0.05
+  }
+}
